@@ -57,6 +57,11 @@ def transcribe(
         "--json",
         help="Output JSON instead of SRT",
     ),
+    save_intermediate: bool = typer.Option(
+        False,
+        "--save-intermediate",
+        help="Save intermediate results (pre-alignment, alignment log)",
+    ),
     device: str = typer.Option(
         "auto",
         "--device",
@@ -115,9 +120,88 @@ def transcribe(
                 audio_path=input_file,
                 context=context,
                 language=language,
+                verbose=verbose,
             )
 
             progress.update(task, description="Writing output...")
+
+            # Save intermediate results if requested
+            if save_intermediate:
+                import json as json_module
+                from chalna.srt_utils import segments_to_srt
+
+                base_path = output.parent / output.stem
+
+                # Save pre-alignment SRT
+                pre_segments = pipeline.get_pre_alignment_segments()
+                if pre_segments:
+                    pre_srt_path = base_path.parent / f"{base_path.name}_pre_align.srt"
+                    pre_srt_content = segments_to_srt(pre_segments, include_speaker=True)
+                    pre_srt_path.write_text(pre_srt_content, encoding="utf-8")
+                    console.print(f"  Pre-alignment SRT: {pre_srt_path}")
+
+                    # Save pre-alignment JSON
+                    pre_json_path = base_path.parent / f"{base_path.name}_pre_align.json"
+                    from chalna.models import TranscriptionResult, TranscriptionMetadata
+                    pre_result = TranscriptionResult(
+                        segments=pre_segments,
+                        metadata=TranscriptionMetadata(
+                            duration=max((s.end_time for s in pre_segments), default=0.0),
+                            language=language,
+                            speakers=list(set(s.speaker_id for s in pre_segments if s.speaker_id)),
+                            model_version="vibevoice-asr",
+                            aligned=False,
+                        )
+                    )
+                    pre_json_path.write_text(pre_result.to_json(), encoding="utf-8")
+                    console.print(f"  Pre-alignment JSON: {pre_json_path}")
+
+                # Save alignment log
+                alignment_log = pipeline.get_alignment_log()
+                if alignment_log:
+                    log_path = base_path.parent / f"{base_path.name}_alignment.log"
+                    log_lines = []
+                    for entry in alignment_log:
+                        status = entry["status"]
+                        idx = entry["index"]
+                        text = entry.get("text", "")
+                        orig = entry.get("original", {})
+
+                        if status == "aligned":
+                            log_lines.append(
+                                f"[{idx:3d}] ALIGNED: "
+                                f"{orig['start']:.2f}→{entry['aligned']['start']:.2f} "
+                                f"({entry['delta']['start']:+.2f}s) | "
+                                f"{orig['end']:.2f}→{entry['aligned']['end']:.2f} "
+                                f"({entry['delta']['end']:+.2f}s) | {text}"
+                            )
+                        elif status == "rejected_expand":
+                            att = entry.get("attempted", {})
+                            log_lines.append(
+                                f"[{idx:3d}] REJECTED: would expand - kept original "
+                                f"{orig['start']:.2f}→{orig['end']:.2f} | {text}"
+                            )
+                        elif status == "invalid_duration":
+                            log_lines.append(
+                                f"[{idx:3d}] INVALID: duration too short - kept original "
+                                f"{orig['start']:.2f}→{orig['end']:.2f} | {text}"
+                            )
+                        elif status == "no_result":
+                            log_lines.append(
+                                f"[{idx:3d}] NO_RESULT: kept original "
+                                f"{orig['start']:.2f}→{orig['end']:.2f} | {text}"
+                            )
+                        elif status == "failed":
+                            log_lines.append(
+                                f"[{idx:3d}] FAILED: {entry.get('error', 'unknown')} | {text}"
+                            )
+                        else:
+                            log_lines.append(
+                                f"[{idx:3d}] {status.upper()}: kept original "
+                                f"{orig.get('start', 0):.2f}→{orig.get('end', 0):.2f} | {text}"
+                            )
+                    log_path.write_text("\n".join(log_lines), encoding="utf-8")
+                    console.print(f"  Alignment log: {log_path}")
 
         # Generate output
         if json_output:

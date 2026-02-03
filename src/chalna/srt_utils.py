@@ -72,9 +72,10 @@ def segments_to_srt(segments: List[Segment], include_speaker: bool = True) -> st
         end_ts = format_timestamp(seg.end_time)
         srt_lines.append(f"{start_ts} --> {end_ts}")
 
-        # Text with optional speaker label
-        if include_speaker and seg.speaker_id:
-            srt_lines.append(f"[{seg.speaker_id}] {seg.text}")
+        # Text with speaker label (always include if include_speaker is True)
+        if include_speaker:
+            speaker_label = seg.speaker_id if seg.speaker_id else "Speaker None"
+            srt_lines.append(f"[{speaker_label}] {seg.text}")
         else:
             srt_lines.append(seg.text)
 

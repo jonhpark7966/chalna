@@ -53,6 +53,10 @@ class ChalnaPipeline:
         self._vibevoice_processor = None
         self._aligner = None
 
+        # Results storage
+        self._last_alignment_log = []
+        self._pre_alignment_segments = None
+
     def _resolve_device(self, device: str) -> str:
         """Resolve device string to actual device."""
         if device == "auto":
@@ -144,6 +148,7 @@ class ChalnaPipeline:
         context: Optional[str] = None,
         language: Optional[str] = None,
         max_new_tokens: int = 32768,
+        verbose: bool = True,
     ) -> TranscriptionResult:
         """
         Transcribe audio file.
@@ -153,6 +158,7 @@ class ChalnaPipeline:
             context: Optional context/hotwords for better accuracy
             language: Language hint (ko, en, ja, zh, etc.)
             max_new_tokens: Maximum tokens for generation
+            verbose: Whether to print detailed alignment logs
 
         Returns:
             TranscriptionResult with segments and metadata
@@ -168,9 +174,26 @@ class ChalnaPipeline:
         # Step 1: VibeVoice ASR
         segments = self._run_vibevoice(audio_path, context, max_new_tokens)
 
+        # Store pre-alignment segments (deep copy)
+        self._pre_alignment_segments = [
+            Segment(
+                index=s.index,
+                start_time=s.start_time,
+                end_time=s.end_time,
+                text=s.text,
+                speaker_id=s.speaker_id,
+                confidence=s.confidence,
+            )
+            for s in segments
+        ]
+
         # Step 2: Qwen Forced Alignment (optional)
         if self.use_alignment and self._aligner and segments:
-            segments = self._run_alignment(audio_path, segments)
+            if verbose:
+                print("\nForced Alignment:")
+                print("  [idx]   original_start → aligned_start (delta) | original_end → aligned_end (delta)")
+                print("  " + "-" * 80)
+            segments = self._run_alignment(audio_path, segments, verbose=verbose)
 
         # Extract metadata
         speakers = list(set(s.speaker_id for s in segments if s.speaker_id))
@@ -185,6 +208,49 @@ class ChalnaPipeline:
         )
 
         return TranscriptionResult(segments=segments, metadata=metadata)
+
+    def get_pre_alignment_segments(self) -> Optional[List[Segment]]:
+        """Get segments before forced alignment was applied."""
+        return self._pre_alignment_segments
+
+    def get_alignment_log(self) -> List[dict]:
+        """Get detailed log of alignment adjustments."""
+        return self._last_alignment_log
+
+    def align_segments(
+        self,
+        audio_path: str | Path,
+        segments: List[Segment],
+        verbose: bool = True,
+    ) -> List[Segment]:
+        """
+        Run forced alignment on provided segments without running ASR.
+
+        Args:
+            audio_path: Path to audio file
+            segments: Pre-existing segments to align
+            verbose: Whether to print detailed logs
+
+        Returns:
+            Aligned segments
+        """
+        audio_path = Path(audio_path)
+        if not audio_path.exists():
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+
+        # Load aligner only
+        self._load_aligner()
+
+        if not self._aligner:
+            print("Aligner not available, returning original segments")
+            return segments
+
+        if verbose:
+            print("\nForced Alignment:")
+            print("  [idx]   original_start → aligned_start (delta) | original_end → aligned_end (delta)")
+            print("  " + "-" * 80)
+
+        return self._run_alignment(audio_path, segments, verbose=verbose)
 
     def _run_vibevoice(
         self,
@@ -298,30 +364,51 @@ class ChalnaPipeline:
         print(f"Failed to parse transcription output. Raw length: {len(raw_output)}")
         return []
 
-    def _run_alignment(self, audio_path: Path, segments: List[Segment]) -> List[Segment]:
-        """Run Qwen forced alignment to refine timestamps."""
+    def _run_alignment(
+        self,
+        audio_path: Path,
+        segments: List[Segment],
+        verbose: bool = True,
+    ) -> List[Segment]:
+        """
+        Run Qwen forced alignment to refine timestamps.
+
+        Strategy: No buffer, tighten-only
+        - Extract exact segment audio (no buffer)
+        - Only apply alignment if it makes timestamps tighter:
+          - aligned_start >= original_start (starts later or same)
+          - aligned_end <= original_end (ends earlier or same)
+        - This reduces overlap caused by VibeVoice's loose timestamps
+        """
         import subprocess
 
         aligned_segments = []
+        alignment_log = []
 
         for seg in segments:
             if not seg.text.strip():
                 aligned_segments.append(seg)
                 continue
 
+            original_start = seg.start_time
+            original_end = seg.end_time
+            original_duration = original_end - original_start
+
+            # Skip very short segments
+            if original_duration < 0.1:
+                aligned_segments.append(seg)
+                continue
+
             try:
-                # Extract audio segment
+                # Extract exact segment audio (no buffer)
                 with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
                     tmp_path = tmp.name
 
-                buffer = 1.5  # seconds before and after
-                duration = seg.end_time - seg.start_time + buffer * 2
-                start_offset = max(0, seg.start_time - buffer)
                 subprocess.run([
                     "ffmpeg", "-y",
                     "-i", str(audio_path),
-                    "-ss", str(start_offset),
-                    "-t", str(duration),
+                    "-ss", str(original_start),
+                    "-t", str(original_duration),
                     "-vn",
                     "-acodec", "pcm_s16le",
                     "-ar", "16000",
@@ -341,27 +428,110 @@ class ChalnaPipeline:
                     first_item = results[0][0]
                     last_item = results[0][-1]
 
-                    # Adjust relative to segment start
-                    offset = start_offset
-                    new_start = offset + first_item.start_time
-                    new_end = offset + last_item.end_time
+                    # Convert to absolute timestamps
+                    new_start = original_start + first_item.start_time
+                    new_end = original_start + last_item.end_time
 
-                    aligned_segments.append(Segment(
-                        index=seg.index,
-                        start_time=new_start,
-                        end_time=new_end,
-                        text=seg.text,
-                        speaker_id=seg.speaker_id,
-                        confidence=seg.confidence,
-                    ))
+                    # Check for valid alignment (positive duration)
+                    aligned_duration = new_end - new_start
+                    if aligned_duration < 0.1:
+                        # Invalid alignment, keep original
+                        aligned_segments.append(seg)
+                        log_entry = {
+                            "index": seg.index,
+                            "status": "invalid_duration",
+                            "original": {"start": original_start, "end": original_end},
+                            "attempted": {"start": new_start, "end": new_end},
+                            "text": seg.text[:50] + "..." if len(seg.text) > 50 else seg.text,
+                        }
+                        alignment_log.append(log_entry)
+
+                        if verbose:
+                            print(f"  [{seg.index:3d}] INVALID: duration={aligned_duration:.2f}s - keeping original")
+                        continue
+
+                    # Tighten-only check:
+                    # - Start should stay same or move later (tighter)
+                    # - End should stay same or move earlier (tighter)
+                    start_tighter = new_start >= original_start - 0.01  # 10ms tolerance
+                    end_tighter = new_end <= original_end + 0.01  # 10ms tolerance
+
+                    if start_tighter and end_tighter:
+                        # Good alignment - apply it
+                        delta_start = new_start - original_start
+                        delta_end = new_end - original_end
+
+                        aligned_segments.append(Segment(
+                            index=seg.index,
+                            start_time=new_start,
+                            end_time=new_end,
+                            text=seg.text,
+                            speaker_id=seg.speaker_id,
+                            confidence=seg.confidence,
+                        ))
+
+                        log_entry = {
+                            "index": seg.index,
+                            "status": "aligned",
+                            "original": {"start": original_start, "end": original_end},
+                            "aligned": {"start": new_start, "end": new_end},
+                            "delta": {"start": delta_start, "end": delta_end},
+                            "text": seg.text[:50] + "..." if len(seg.text) > 50 else seg.text,
+                        }
+                        alignment_log.append(log_entry)
+
+                        if verbose:
+                            print(f"  [{seg.index:3d}] {original_start:7.2f}→{new_start:7.2f} ({delta_start:+.2f}s) | "
+                                  f"{original_end:7.2f}→{new_end:7.2f} ({delta_end:+.2f}s)")
+                    else:
+                        # Alignment would expand timestamps - reject
+                        aligned_segments.append(seg)
+                        log_entry = {
+                            "index": seg.index,
+                            "status": "rejected_expand",
+                            "original": {"start": original_start, "end": original_end},
+                            "attempted": {"start": new_start, "end": new_end},
+                            "reason": f"start_tighter={start_tighter}, end_tighter={end_tighter}",
+                            "text": seg.text[:50] + "..." if len(seg.text) > 50 else seg.text,
+                        }
+                        alignment_log.append(log_entry)
+
+                        if verbose:
+                            delta_s = new_start - original_start
+                            delta_e = new_end - original_end
+                            print(f"  [{seg.index:3d}] REJECTED: would expand "
+                                  f"(start {delta_s:+.2f}s, end {delta_e:+.2f}s) - keeping original")
                 else:
                     aligned_segments.append(seg)
+                    log_entry = {
+                        "index": seg.index,
+                        "status": "no_result",
+                        "original": {"start": original_start, "end": original_end},
+                        "text": seg.text[:50] + "..." if len(seg.text) > 50 else seg.text,
+                    }
+                    alignment_log.append(log_entry)
+
+                    if verbose:
+                        print(f"  [{seg.index:3d}] No alignment result - keeping original")
 
                 # Cleanup
                 Path(tmp_path).unlink(missing_ok=True)
 
             except Exception as e:
-                print(f"Warning: Alignment failed for segment {seg.index}: {e}")
                 aligned_segments.append(seg)
+                log_entry = {
+                    "index": seg.index,
+                    "status": "failed",
+                    "error": str(e),
+                    "original": {"start": original_start, "end": original_end},
+                    "text": seg.text[:50] + "..." if len(seg.text) > 50 else seg.text,
+                }
+                alignment_log.append(log_entry)
+
+                if verbose:
+                    print(f"  [{seg.index:3d}] FAILED: {e}")
+
+        # Store alignment log for later access
+        self._last_alignment_log = alignment_log
 
         return aligned_segments

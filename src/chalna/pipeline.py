@@ -463,6 +463,218 @@ class ChalnaPipeline:
         print(f"Failed to parse transcription output. Raw length: {len(raw_output)}")
         return []
 
+    def _split_into_sentences(self, text: str) -> List[str]:
+        """
+        Split text into sentences based on sentence-ending punctuation and commas.
+
+        Handles Korean, English, and mixed text.
+
+        Split criteria:
+        1. Always split on sentence-ending punctuation: . ? ! 。？！
+        2. Split on comma only if:
+           - Text before comma >= 8 characters
+           - Text after comma >= 8 characters
+           - No other comma within 15 characters before (not a list)
+        """
+        import re
+
+        # First, split on sentence-ending punctuation
+        # Split on . ? ! 。？！ followed by space or end of string
+        # But preserve the punctuation with the sentence
+        pattern = r'([.?!。？！]+)\s*'
+
+        parts = re.split(pattern, text)
+
+        sentences = []
+        current = ""
+
+        for i, part in enumerate(parts):
+            if not part:
+                continue
+            # Check if this part is punctuation
+            if re.match(r'^[.?!。？！]+$', part):
+                current += part
+                if current.strip():
+                    sentences.append(current.strip())
+                current = ""
+            else:
+                current += part
+
+        # Add remaining text
+        if current.strip():
+            sentences.append(current.strip())
+
+        # Now, further split on commas with criteria
+        final_sentences = []
+        for sentence in sentences:
+            split_result = self._split_on_comma(sentence)
+            final_sentences.extend(split_result)
+
+        # Filter out very short segments (likely noise)
+        final_sentences = [s for s in final_sentences if len(s) > 1]
+
+        return final_sentences
+
+    def _split_on_comma(self, text: str) -> List[str]:
+        """
+        Split text on commas with smart criteria.
+
+        Only split if:
+        1. Text before comma >= 8 characters
+        2. Text after comma >= 8 characters
+        3. No other comma within 15 characters before (not a list pattern)
+        """
+        MIN_LENGTH = 8
+        LIST_CHECK_DISTANCE = 15
+
+        # Find all comma positions
+        comma_positions = [i for i, c in enumerate(text) if c == ',']
+
+        if not comma_positions:
+            return [text]
+
+        # Determine which commas are valid split points
+        valid_splits = []
+
+        for pos in comma_positions:
+            before = text[:pos]
+            after = text[pos + 1:]
+
+            # Check minimum length criteria
+            if len(before.strip()) < MIN_LENGTH or len(after.strip()) < MIN_LENGTH:
+                continue
+
+            # Check if there's another comma within LIST_CHECK_DISTANCE before this one
+            is_list_pattern = False
+            check_start = max(0, pos - LIST_CHECK_DISTANCE)
+            preceding_text = text[check_start:pos]
+            if ',' in preceding_text:
+                is_list_pattern = True
+
+            if not is_list_pattern:
+                valid_splits.append(pos)
+
+        if not valid_splits:
+            return [text]
+
+        # Split at valid positions
+        result = []
+        last_pos = 0
+
+        for pos in valid_splits:
+            segment = text[last_pos:pos + 1].strip()  # Include comma in previous segment
+            if segment:
+                result.append(segment)
+            last_pos = pos + 1
+
+        # Add remaining text
+        remaining = text[last_pos:].strip()
+        if remaining:
+            result.append(remaining)
+
+        return result
+
+    def _find_sentence_boundaries(
+        self,
+        alignment_results: List,
+        sentences: List[str],
+        original_text: str,
+    ) -> List[tuple]:
+        """
+        Find timestamp boundaries for each sentence using word-level alignment.
+
+        Strategy: Use character positions from original text to map to aligned words.
+
+        Args:
+            alignment_results: Word-level alignment from Qwen aligner
+            sentences: List of sentences to find boundaries for
+            original_text: Original full text (for position tracking)
+
+        Returns:
+            List of (start_time, end_time, sentence_text) tuples
+        """
+        if not alignment_results or not alignment_results[0]:
+            return []
+
+        words = alignment_results[0]
+        if not words:
+            return []
+
+        # Build character-to-word mapping from aligned results
+        # Each word has .text, .start_time, .end_time
+        char_to_word_idx = []
+        for idx, word in enumerate(words):
+            for _ in word.text:
+                char_to_word_idx.append(idx)
+
+        aligned_text = "".join(w.text for w in words)
+        aligned_len = len(aligned_text)
+
+        if aligned_len == 0:
+            return []
+
+        # Remove spaces from original text for alignment matching
+        original_no_space = original_text.replace(" ", "")
+
+        # Build mapping: original char position -> aligned char position
+        # This handles cases where aligned text might have slight differences
+        def fuzzy_char_position(orig_pos: int, search_char: str) -> int:
+            """Find approximate position in aligned text for a character."""
+            # Direct ratio mapping
+            ratio = orig_pos / max(len(original_no_space), 1)
+            approx_pos = int(ratio * aligned_len)
+            return min(approx_pos, aligned_len - 1)
+
+        boundaries = []
+        current_orig_pos = 0  # Position in original_no_space
+
+        for sentence in sentences:
+            sentence_no_space = sentence.replace(" ", "")
+            sentence_len = len(sentence_no_space)
+
+            if sentence_len == 0:
+                continue
+
+            # Find sentence start position in original text
+            sent_start_in_orig = original_no_space.find(sentence_no_space, current_orig_pos)
+            if sent_start_in_orig == -1:
+                # Try to find with first few chars
+                search_len = min(5, sentence_len)
+                sent_start_in_orig = original_no_space.find(sentence_no_space[:search_len], current_orig_pos)
+
+            if sent_start_in_orig == -1:
+                # Cannot find, use ratio-based estimation
+                sent_start_in_orig = current_orig_pos
+
+            sent_end_in_orig = sent_start_in_orig + sentence_len
+
+            # Map to aligned text positions using ratio
+            start_ratio = sent_start_in_orig / max(len(original_no_space), 1)
+            end_ratio = sent_end_in_orig / max(len(original_no_space), 1)
+
+            aligned_start_pos = int(start_ratio * aligned_len)
+            aligned_end_pos = int(end_ratio * aligned_len)
+
+            # Clamp to valid range
+            aligned_start_pos = max(0, min(aligned_start_pos, aligned_len - 1))
+            aligned_end_pos = max(aligned_start_pos + 1, min(aligned_end_pos, aligned_len))
+
+            # Get word indices
+            if aligned_start_pos < len(char_to_word_idx) and aligned_end_pos - 1 < len(char_to_word_idx):
+                start_word_idx = char_to_word_idx[aligned_start_pos]
+                end_word_idx = char_to_word_idx[min(aligned_end_pos - 1, len(char_to_word_idx) - 1)]
+
+                start_time = words[start_word_idx].start_time
+                end_time = words[end_word_idx].end_time
+
+                # Ensure valid duration
+                if end_time > start_time:
+                    boundaries.append((start_time, end_time, sentence))
+
+            current_orig_pos = sent_end_in_orig
+
+        return boundaries
+
     def _run_alignment(
         self,
         audio_path: Path,
@@ -470,19 +682,20 @@ class ChalnaPipeline:
         verbose: bool = True,
     ) -> List[Segment]:
         """
-        Run Qwen forced alignment to refine timestamps.
+        Run Qwen forced alignment to refine timestamps and split sentences.
 
-        Strategy: No buffer, tighten-only
-        - Extract exact segment audio (no buffer)
-        - Only apply alignment if it makes timestamps tighter:
-          - aligned_start >= original_start (starts later or same)
-          - aligned_end <= original_end (ends earlier or same)
-        - This reduces overlap caused by VibeVoice's loose timestamps
+        Strategy:
+        1. For each segment, detect sentence boundaries
+        2. Run word-level forced alignment
+        3. Split multi-sentence segments using word timestamps
+        4. Apply tighten-only constraint for timestamp refinement
+        5. If alignment fails, keep original segment
         """
         import subprocess
 
         aligned_segments = []
         alignment_log = []
+        segment_index = 1  # Will be reassigned after processing
 
         for seg in segments:
             if not seg.text.strip():
@@ -525,19 +738,35 @@ class ChalnaPipeline:
                     language="Korean",
                 )
 
-                # Update timestamps
-                if results and len(results) > 0 and len(results[0]) > 0:
+                # Check for valid alignment results
+                if not results or len(results) == 0 or len(results[0]) == 0:
+                    aligned_segments.append(seg)
+                    log_entry = {
+                        "index": seg.index,
+                        "status": "no_result",
+                        "original": {"start": original_start, "end": original_end},
+                        "text": seg.text[:50] + "..." if len(seg.text) > 50 else seg.text,
+                    }
+                    alignment_log.append(log_entry)
+                    if verbose:
+                        print(f"  [{seg.index:3d}] No alignment result - keeping original")
+                    Path(tmp_path).unlink(missing_ok=True)
+                    continue
+
+                # Split into sentences
+                sentences = self._split_into_sentences(seg.text)
+
+                # If only one sentence or split failed, use simple alignment
+                if len(sentences) <= 1:
+                    # Simple single-segment alignment (original logic)
                     first_item = results[0][0]
                     last_item = results[0][-1]
 
-                    # Convert to absolute timestamps
                     new_start = original_start + first_item.start_time
                     new_end = original_start + last_item.end_time
 
-                    # Check for valid alignment (positive duration)
                     aligned_duration = new_end - new_start
                     if aligned_duration < 0.1:
-                        # Invalid alignment, keep original
                         aligned_segments.append(seg)
                         log_entry = {
                             "index": seg.index,
@@ -547,74 +776,117 @@ class ChalnaPipeline:
                             "text": seg.text[:50] + "..." if len(seg.text) > 50 else seg.text,
                         }
                         alignment_log.append(log_entry)
-
                         if verbose:
                             print(f"  [{seg.index:3d}] INVALID: duration={aligned_duration:.2f}s - keeping original")
-                        continue
-
-                    # Tighten-only check:
-                    # - Start should stay same or move later (tighter)
-                    # - End should stay same or move earlier (tighter)
-                    start_tighter = new_start >= original_start - 0.01  # 10ms tolerance
-                    end_tighter = new_end <= original_end + 0.01  # 10ms tolerance
-
-                    if start_tighter and end_tighter:
-                        # Good alignment - apply it
-                        delta_start = new_start - original_start
-                        delta_end = new_end - original_end
-
-                        aligned_segments.append(Segment(
-                            index=seg.index,
-                            start_time=new_start,
-                            end_time=new_end,
-                            text=seg.text,
-                            speaker_id=seg.speaker_id,
-                            confidence=seg.confidence,
-                        ))
-
-                        log_entry = {
-                            "index": seg.index,
-                            "status": "aligned",
-                            "original": {"start": original_start, "end": original_end},
-                            "aligned": {"start": new_start, "end": new_end},
-                            "delta": {"start": delta_start, "end": delta_end},
-                            "text": seg.text[:50] + "..." if len(seg.text) > 50 else seg.text,
-                        }
-                        alignment_log.append(log_entry)
-
-                        if verbose:
-                            print(f"  [{seg.index:3d}] {original_start:7.2f}→{new_start:7.2f} ({delta_start:+.2f}s) | "
-                                  f"{original_end:7.2f}→{new_end:7.2f} ({delta_end:+.2f}s)")
                     else:
-                        # Alignment would expand timestamps - reject
+                        # Tighten-only check
+                        start_tighter = new_start >= original_start - 0.01
+                        end_tighter = new_end <= original_end + 0.01
+
+                        if start_tighter and end_tighter:
+                            delta_start = new_start - original_start
+                            delta_end = new_end - original_end
+
+                            aligned_segments.append(Segment(
+                                index=seg.index,
+                                start_time=new_start,
+                                end_time=new_end,
+                                text=seg.text,
+                                speaker_id=seg.speaker_id,
+                                confidence=seg.confidence,
+                            ))
+
+                            log_entry = {
+                                "index": seg.index,
+                                "status": "aligned",
+                                "original": {"start": original_start, "end": original_end},
+                                "aligned": {"start": new_start, "end": new_end},
+                                "delta": {"start": delta_start, "end": delta_end},
+                                "text": seg.text[:50] + "..." if len(seg.text) > 50 else seg.text,
+                            }
+                            alignment_log.append(log_entry)
+
+                            if verbose:
+                                print(f"  [{seg.index:3d}] {original_start:7.2f}→{new_start:7.2f} ({delta_start:+.2f}s) | "
+                                      f"{original_end:7.2f}→{new_end:7.2f} ({delta_end:+.2f}s)")
+                        else:
+                            aligned_segments.append(seg)
+                            log_entry = {
+                                "index": seg.index,
+                                "status": "rejected_expand",
+                                "original": {"start": original_start, "end": original_end},
+                                "attempted": {"start": new_start, "end": new_end},
+                                "text": seg.text[:50] + "..." if len(seg.text) > 50 else seg.text,
+                            }
+                            alignment_log.append(log_entry)
+
+                            if verbose:
+                                delta_s = new_start - original_start
+                                delta_e = new_end - original_end
+                                print(f"  [{seg.index:3d}] REJECTED: would expand "
+                                      f"(start {delta_s:+.2f}s, end {delta_e:+.2f}s) - keeping original")
+                else:
+                    # Multiple sentences - find boundaries and split
+                    boundaries = self._find_sentence_boundaries(results, sentences, seg.text)
+
+                    if not boundaries or len(boundaries) != len(sentences):
+                        # Boundary detection failed, fall back to original segment
                         aligned_segments.append(seg)
                         log_entry = {
                             "index": seg.index,
-                            "status": "rejected_expand",
+                            "status": "sentence_split_failed",
                             "original": {"start": original_start, "end": original_end},
-                            "attempted": {"start": new_start, "end": new_end},
-                            "reason": f"start_tighter={start_tighter}, end_tighter={end_tighter}",
+                            "sentences_detected": len(sentences),
+                            "boundaries_found": len(boundaries) if boundaries else 0,
                             "text": seg.text[:50] + "..." if len(seg.text) > 50 else seg.text,
                         }
                         alignment_log.append(log_entry)
 
                         if verbose:
-                            delta_s = new_start - original_start
-                            delta_e = new_end - original_end
-                            print(f"  [{seg.index:3d}] REJECTED: would expand "
-                                  f"(start {delta_s:+.2f}s, end {delta_e:+.2f}s) - keeping original")
-                else:
-                    aligned_segments.append(seg)
-                    log_entry = {
-                        "index": seg.index,
-                        "status": "no_result",
-                        "original": {"start": original_start, "end": original_end},
-                        "text": seg.text[:50] + "..." if len(seg.text) > 50 else seg.text,
-                    }
-                    alignment_log.append(log_entry)
+                            print(f"  [{seg.index:3d}] SPLIT_FAILED: {len(sentences)} sentences, "
+                                  f"{len(boundaries) if boundaries else 0} boundaries - keeping original")
+                    else:
+                        # Successfully split - create new segments
+                        if verbose:
+                            print(f"  [{seg.index:3d}] SPLIT: {len(sentences)} sentences")
 
-                    if verbose:
-                        print(f"  [{seg.index:3d}] No alignment result - keeping original")
+                        for i, (rel_start, rel_end, sentence_text) in enumerate(boundaries):
+                            # Convert to absolute timestamps
+                            abs_start = original_start + rel_start
+                            abs_end = original_start + rel_end
+
+                            # Validate duration
+                            if abs_end - abs_start < 0.05:
+                                continue
+
+                            # Tighten to original bounds
+                            abs_start = max(abs_start, original_start)
+                            abs_end = min(abs_end, original_end)
+
+                            new_seg = Segment(
+                                index=seg.index,  # Will be re-indexed later
+                                start_time=abs_start,
+                                end_time=abs_end,
+                                text=sentence_text,
+                                speaker_id=seg.speaker_id,
+                                confidence=seg.confidence,
+                            )
+                            aligned_segments.append(new_seg)
+
+                            log_entry = {
+                                "index": seg.index,
+                                "status": "split",
+                                "split_index": i + 1,
+                                "split_total": len(boundaries),
+                                "original": {"start": original_start, "end": original_end},
+                                "aligned": {"start": abs_start, "end": abs_end},
+                                "text": sentence_text[:50] + "..." if len(sentence_text) > 50 else sentence_text,
+                            }
+                            alignment_log.append(log_entry)
+
+                            if verbose:
+                                print(f"      [{i+1}/{len(boundaries)}] {abs_start:7.2f}→{abs_end:7.2f} | "
+                                      f"{sentence_text[:40]}{'...' if len(sentence_text) > 40 else ''}")
 
                 # Cleanup
                 Path(tmp_path).unlink(missing_ok=True)
@@ -633,7 +905,50 @@ class ChalnaPipeline:
                 if verbose:
                     print(f"  [{seg.index:3d}] FAILED: {e}")
 
+        # Fix overlapping timestamps using midpoint interpolation
+        aligned_segments = self._fix_overlapping_timestamps(aligned_segments, verbose=verbose)
+
+        # Re-index all segments
+        for i, seg in enumerate(aligned_segments, start=1):
+            seg.index = i
+
         # Store alignment log for later access
         self._last_alignment_log = alignment_log
 
         return aligned_segments
+
+    def _fix_overlapping_timestamps(
+        self,
+        segments: List[Segment],
+        verbose: bool = True,
+    ) -> List[Segment]:
+        """
+        Fix overlapping timestamps between consecutive segments using midpoint interpolation.
+
+        When segment N's end_time > segment N+1's start_time:
+        - Calculate midpoint = (end_time + start_time) / 2
+        - Set segment N's end_time = midpoint
+        - Set segment N+1's start_time = midpoint
+        """
+        if len(segments) <= 1:
+            return segments
+
+        fixed_count = 0
+
+        for i in range(len(segments) - 1):
+            current = segments[i]
+            next_seg = segments[i + 1]
+
+            if current.end_time > next_seg.start_time:
+                # Overlap detected - use midpoint interpolation
+                midpoint = (current.end_time + next_seg.start_time) / 2
+
+                # Update timestamps
+                current.end_time = midpoint
+                next_seg.start_time = midpoint
+                fixed_count += 1
+
+        if verbose and fixed_count > 0:
+            print(f"\n  Fixed {fixed_count} overlapping timestamp(s) using midpoint interpolation")
+
+        return segments

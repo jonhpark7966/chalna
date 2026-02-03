@@ -19,12 +19,16 @@ from chalna.exceptions import (
     DiskSpaceError,
     FFmpegNotFoundError,
     FilePermissionError,
+    FileTooLargeError,
     UnsupportedFormatError,
 )
 
 
 # Maximum audio duration in seconds (1 hour)
 MAX_DURATION_SECONDS = 3600
+
+# Maximum file size in MB (2GB)
+MAX_FILE_SIZE_MB = 2048
 
 # Supported audio formats
 SUPPORTED_AUDIO_FORMATS = {
@@ -217,30 +221,44 @@ def get_audio_info(file_path: Path) -> AudioInfo:
 def validate_audio_file(
     file_path: Path,
     max_duration: float = MAX_DURATION_SECONDS,
+    max_file_size_mb: float = MAX_FILE_SIZE_MB,
 ) -> AudioInfo:
     """Validate audio file for processing.
 
     Performs comprehensive validation:
     1. Check file exists and is readable
-    2. Check format is supported
-    3. Check duration is within limits
-    4. Verify file is not corrupted
+    2. Check file size is within limits
+    3. Check format is supported
+    4. Check duration is within limits
+    5. Verify file is not corrupted
 
     Args:
         file_path: Path to the audio/video file.
         max_duration: Maximum allowed duration in seconds (default: 1 hour).
+        max_file_size_mb: Maximum allowed file size in MB (default: 2GB).
 
     Returns:
         AudioInfo with validated file information.
 
     Raises:
         AudioTooLongError: If audio exceeds max_duration.
+        FileTooLargeError: If file exceeds max_file_size_mb.
         UnsupportedFormatError: If format is not supported.
         CorruptedFileError: If file is corrupted.
         FilePermissionError: If file cannot be read.
         FFmpegNotFoundError: If ffprobe is not installed.
     """
     file_path = Path(file_path)
+
+    # Check file size early (fast rejection before ffprobe)
+    if file_path.exists():
+        file_size_bytes = file_path.stat().st_size
+        file_size_mb = file_size_bytes / (1024 * 1024)
+        if file_size_mb > max_file_size_mb:
+            raise FileTooLargeError(
+                file_size_mb=file_size_mb,
+                max_size_mb=max_file_size_mb,
+            )
 
     # Get file extension
     extension = file_path.suffix.lstrip(".").lower()

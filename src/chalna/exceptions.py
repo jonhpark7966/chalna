@@ -17,6 +17,7 @@ class ErrorCode(str, Enum):
     AUDIO_TOO_LONG = "E1001"
     UNSUPPORTED_FORMAT = "E1002"
     CORRUPTED_FILE = "E1003"
+    FILE_TOO_LARGE = "E1004"
     PERMISSION_DENIED = "E1005"
 
     # Runtime (2xxx)
@@ -157,6 +158,29 @@ class FilePermissionError(ChalnaError):
         message = f"Permission denied: cannot read file {file_path}"
         details = {
             "file_path": file_path,
+        }
+        super().__init__(message, details, cause)
+
+
+class FileTooLargeError(ChalnaError):
+    """Raised when file size exceeds the maximum allowed (2GB)."""
+
+    error_code = ErrorCode.FILE_TOO_LARGE
+    http_status = 400
+
+    def __init__(
+        self,
+        file_size_mb: float,
+        max_size_mb: float = 2048,
+        cause: Optional[Exception] = None,
+    ):
+        message = (
+            f"File size ({file_size_mb:.1f}MB) exceeds maximum "
+            f"allowed ({max_size_mb:.0f}MB / {max_size_mb / 1024:.1f}GB)"
+        )
+        details = {
+            "file_size_mb": file_size_mb,
+            "max_size_mb": max_size_mb,
         }
         super().__init__(message, details, cause)
 

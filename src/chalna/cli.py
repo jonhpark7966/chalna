@@ -19,6 +19,7 @@ from chalna.exceptions import (
     EmptyTranscriptionError,
     FFmpegNotFoundError,
     FilePermissionError,
+    FileTooLargeError,
     ModelDownloadError,
     ModelLoadError,
     OutOfMemoryError,
@@ -245,6 +246,15 @@ def transcribe(
         console.print()
         console.print("[dim]Tip: Split long audio files using ffmpeg:[/dim]")
         console.print("[dim]  ffmpeg -i input.mp3 -ss 0 -t 3600 part1.mp3[/dim]")
+        raise typer.Exit(code=1)
+
+    except FileTooLargeError as e:
+        console.print(f"[bold red]Error:[/bold red] File too large")
+        console.print(f"  File size: {e.details['file_size_mb']:.1f} MB")
+        console.print(f"  Maximum: {e.details['max_size_mb']:.0f} MB ({e.details['max_size_mb'] / 1024:.1f} GB)")
+        console.print()
+        console.print("[dim]Tip: Compress or split the file:[/dim]")
+        console.print("[dim]  ffmpeg -i input.mp4 -b:a 128k compressed.mp4[/dim]")
         raise typer.Exit(code=1)
 
     except UnsupportedFormatError as e:

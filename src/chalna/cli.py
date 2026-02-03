@@ -416,6 +416,48 @@ def serve(
 
 
 @app.command()
+def web(
+    host: str = typer.Option(
+        "0.0.0.0",
+        "--host",
+        help="Host to bind to",
+    ),
+    port: int = typer.Option(
+        7860,
+        "--port", "-p",
+        help="Port to bind to",
+    ),
+    share: bool = typer.Option(
+        False,
+        "--share",
+        help="Create a shareable link (Gradio)",
+    ),
+    device: str = typer.Option(
+        "auto",
+        "--device",
+        help="Device to use (cuda, cpu, mps, xpu, auto)",
+    ),
+):
+    """
+    Start the Chalna Gradio web interface.
+
+    Examples:
+
+        chalna web --port 7860
+
+        chalna web --share
+    """
+    console.print(f"[bold blue]Chalna (찰나)[/bold blue] - Web Interface")
+    console.print()
+    console.print(f"  Host: {host}")
+    console.print(f"  Port: {port}")
+    console.print()
+
+    from chalna.web import launch
+    launch(host=host, port=port, share=share, device=device)
+
+
+@app.command()
 def version():
     """Show version information."""
     from chalna import __version__

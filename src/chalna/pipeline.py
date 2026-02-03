@@ -87,25 +87,22 @@ class ChalnaPipeline:
 
         print(f"Loading VibeVoice model from {self.vibevoice_path}...")
 
-        # Determine attention implementation
-        attn_impl = "flash_attention_2" if self.device == "cuda" else "eager"
-        try:
-            self._vibevoice_model = VibeVoiceASRForConditionalGeneration.from_pretrained(
-                self.vibevoice_path,
-                dtype=self.dtype,
-                device_map=self.device,
-                attn_implementation=attn_impl,
-                trust_remote_code=True,
-            )
-        except Exception:
-            # Fallback to sdpa or eager
-            self._vibevoice_model = VibeVoiceASRForConditionalGeneration.from_pretrained(
-                self.vibevoice_path,
-                dtype=self.dtype,
-                device_map=self.device,
-                attn_implementation="eager",
-                trust_remote_code=True,
-            )
+        # Try attention implementations in order: sdpa > eager
+        for attn_impl in ["sdpa", "eager"]:
+            try:
+                self._vibevoice_model = VibeVoiceASRForConditionalGeneration.from_pretrained(
+                    self.vibevoice_path,
+                    dtype=self.dtype,
+                    device_map=self.device,
+                    attn_implementation=attn_impl,
+                    trust_remote_code=True,
+                )
+                print(f"Using attention implementation: {attn_impl}")
+                break
+            except Exception as e:
+                print(f"Failed to load with {attn_impl}: {e}")
+                if attn_impl == "eager":
+                    raise
 
         self._vibevoice_processor = VibeVoiceASRProcessor.from_pretrained(
             self.vibevoice_path,
@@ -224,21 +221,82 @@ class ChalnaPipeline:
             skip_special_tokens=True,
         )[0]
 
-        # Parse output
-        parsed = self._vibevoice_processor.post_process_transcription(raw_output)
+        # Parse output - try multiple methods
+        parsed = self._parse_transcription(raw_output)
 
         # Convert to Segment objects
         segments = []
         for i, item in enumerate(parsed, start=1):
+            # Handle different key naming conventions
+            start_time = item.get("start_time") or item.get("Start time") or item.get("Start") or 0
+            end_time = item.get("end_time") or item.get("End time") or item.get("End") or 0
+            text = item.get("text") or item.get("Content") or ""
+
+            # Handle speaker ID - check for various key names and handle 0 as valid
+            speaker = None
+            for key in ["speaker_id", "Speaker ID", "Speaker"]:
+                if key in item and item[key] is not None:
+                    speaker = item[key]
+                    break
+
+            # Skip environmental sounds and silence markers
+            if text.startswith("[") and text.endswith("]"):
+                continue
+
             segments.append(Segment(
                 index=i,
-                start_time=float(item.get("start_time", 0)),
-                end_time=float(item.get("end_time", 0)),
-                text=item.get("text", ""),
-                speaker_id=str(item.get("speaker_id", "")) if item.get("speaker_id") else None,
+                start_time=float(start_time),
+                end_time=float(end_time),
+                text=text,
+                speaker_id=f"Speaker {speaker}" if speaker is not None else None,
             ))
 
+        # Re-index after filtering
+        for i, seg in enumerate(segments, start=1):
+            seg.index = i
+
         return segments
+
+    def _parse_transcription(self, raw_output: str) -> List[dict]:
+        """Parse transcription output from VibeVoice."""
+        import re
+
+        # Try processor's post_process first
+        try:
+            parsed = self._vibevoice_processor.post_process_transcription(raw_output)
+            if parsed:
+                return parsed
+        except Exception as e:
+            print(f"post_process_transcription failed: {e}")
+
+        # Manual parsing - find JSON array in output
+        # Look for content after "assistant" tag
+        if "assistant" in raw_output:
+            raw_output = raw_output.split("assistant")[-1].strip()
+
+        # Try to find JSON array
+        json_match = re.search(r'\[.*\]', raw_output, re.DOTALL)
+        if json_match:
+            try:
+                return json.loads(json_match.group())
+            except json.JSONDecodeError as e:
+                print(f"JSON parse error: {e}")
+
+        # Try parsing as JSONL (one object per line)
+        results = []
+        for line in raw_output.split('\n'):
+            line = line.strip()
+            if line.startswith('{') and line.endswith('}'):
+                try:
+                    results.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+
+        if results:
+            return results
+
+        print(f"Failed to parse transcription output. Raw length: {len(raw_output)}")
+        return []
 
     def _run_alignment(self, audio_path: Path, segments: List[Segment]) -> List[Segment]:
         """Run Qwen forced alignment to refine timestamps."""

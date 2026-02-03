@@ -8,11 +8,23 @@ import json
 import sys
 import tempfile
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import torch
 
+from chalna.exceptions import (
+    EmptyTranscriptionError,
+    ModelDownloadError,
+    ModelLoadError,
+    OutOfMemoryError,
+    TempFileError,
+)
 from chalna.models import Segment, TranscriptionMetadata, TranscriptionResult
+from chalna.validation import (
+    check_disk_space,
+    estimate_temp_space_required,
+    validate_audio_file,
+)
 
 
 class ChalnaPipeline:
@@ -77,7 +89,13 @@ class ChalnaPipeline:
         return torch.float32
 
     def _load_vibevoice(self):
-        """Load VibeVoice model and processor."""
+        """Load VibeVoice model and processor.
+
+        Raises:
+            OutOfMemoryError: If GPU/CPU memory is exhausted.
+            ModelLoadError: If model loading fails.
+            ModelDownloadError: If model download fails.
+        """
         if self._vibevoice_model is not None:
             return
 
@@ -86,12 +104,20 @@ class ChalnaPipeline:
         if vibevoice_path.exists():
             sys.path.insert(0, str(vibevoice_path))
 
-        from vibevoice.modular.modeling_vibevoice_asr import VibeVoiceASRForConditionalGeneration
-        from vibevoice.processor.vibevoice_asr_processor import VibeVoiceASRProcessor
+        try:
+            from vibevoice.modular.modeling_vibevoice_asr import VibeVoiceASRForConditionalGeneration
+            from vibevoice.processor.vibevoice_asr_processor import VibeVoiceASRProcessor
+        except ImportError as e:
+            raise ModelLoadError(
+                model_name="VibeVoice",
+                reason="VibeVoice module not found",
+                cause=e,
+            )
 
         print(f"Loading VibeVoice model from {self.vibevoice_path}...")
 
         # Try attention implementations in order: sdpa > eager
+        last_error = None
         for attn_impl in ["sdpa", "eager"]:
             try:
                 self._vibevoice_model = VibeVoiceASRForConditionalGeneration.from_pretrained(
@@ -103,20 +129,51 @@ class ChalnaPipeline:
                 )
                 print(f"Using attention implementation: {attn_impl}")
                 break
+            except torch.cuda.OutOfMemoryError as e:
+                raise OutOfMemoryError(memory_type="GPU", cause=e)
+            except MemoryError as e:
+                raise OutOfMemoryError(memory_type="CPU", cause=e)
+            except OSError as e:
+                # Often indicates download failure
+                if "Connection" in str(e) or "HTTP" in str(e):
+                    raise ModelDownloadError(model_name=self.vibevoice_path, cause=e)
+                last_error = e
+                if attn_impl == "eager":
+                    raise ModelLoadError(
+                        model_name=self.vibevoice_path,
+                        reason=str(e),
+                        cause=e,
+                    )
             except Exception as e:
                 print(f"Failed to load with {attn_impl}: {e}")
+                last_error = e
                 if attn_impl == "eager":
-                    raise
+                    raise ModelLoadError(
+                        model_name=self.vibevoice_path,
+                        reason=str(e),
+                        cause=e,
+                    )
 
-        self._vibevoice_processor = VibeVoiceASRProcessor.from_pretrained(
-            self.vibevoice_path,
-            language_model_pretrained_name="Qwen/Qwen2.5-7B",
-        )
+        try:
+            self._vibevoice_processor = VibeVoiceASRProcessor.from_pretrained(
+                self.vibevoice_path,
+                language_model_pretrained_name="Qwen/Qwen2.5-7B",
+            )
+        except Exception as e:
+            raise ModelLoadError(
+                model_name="VibeVoiceASRProcessor",
+                reason=str(e),
+                cause=e,
+            )
 
         print("VibeVoice model loaded.")
 
     def _load_aligner(self):
-        """Load Qwen forced aligner."""
+        """Load Qwen forced aligner.
+
+        Raises:
+            OutOfMemoryError: If GPU/CPU memory is exhausted.
+        """
         if self._aligner is not None:
             return
 
@@ -138,6 +195,10 @@ class ChalnaPipeline:
         except ImportError:
             print("Warning: qwen_asr not installed. Alignment will be skipped.")
             self.use_alignment = False
+        except torch.cuda.OutOfMemoryError as e:
+            raise OutOfMemoryError(memory_type="GPU", cause=e)
+        except MemoryError as e:
+            raise OutOfMemoryError(memory_type="CPU", cause=e)
         except Exception as e:
             print(f"Warning: Failed to load aligner: {e}. Alignment will be skipped.")
             self.use_alignment = False
@@ -149,6 +210,7 @@ class ChalnaPipeline:
         language: Optional[str] = None,
         max_new_tokens: int = 32768,
         verbose: bool = True,
+        progress_callback: Optional[Callable[[str, float], None]] = None,
     ) -> TranscriptionResult:
         """
         Transcribe audio file.
@@ -159,20 +221,55 @@ class ChalnaPipeline:
             language: Language hint (ko, en, ja, zh, etc.)
             max_new_tokens: Maximum tokens for generation
             verbose: Whether to print detailed alignment logs
+            progress_callback: Optional callback(stage, progress) for progress updates
 
         Returns:
             TranscriptionResult with segments and metadata
+
+        Raises:
+            AudioTooLongError: If audio exceeds 1 hour.
+            UnsupportedFormatError: If format is not supported.
+            CorruptedFileError: If file is corrupted.
+            OutOfMemoryError: If GPU/CPU memory is exhausted.
+            EmptyTranscriptionError: If no speech is detected.
         """
         audio_path = Path(audio_path)
         if not audio_path.exists():
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
+        def _progress(stage: str, value: float):
+            if progress_callback:
+                progress_callback(stage, value)
+
+        # Step 0: Validate audio file (duration, format, integrity)
+        _progress("validating", 0.0)
+        audio_info = validate_audio_file(audio_path)
+        _progress("validating", 1.0)
+
+        # Check disk space for temp files
+        required_mb = estimate_temp_space_required(audio_info)
+        check_disk_space(required_mb)
+
         # Load models
+        _progress("loading_models", 0.0)
         self._load_vibevoice()
+        _progress("loading_models", 0.5)
         self._load_aligner()
+        _progress("loading_models", 1.0)
 
         # Step 1: VibeVoice ASR
-        segments = self._run_vibevoice(audio_path, context, max_new_tokens)
+        _progress("transcribing", 0.0)
+        try:
+            segments = self._run_vibevoice(audio_path, context, max_new_tokens)
+        except torch.cuda.OutOfMemoryError as e:
+            raise OutOfMemoryError(memory_type="GPU", cause=e)
+        except MemoryError as e:
+            raise OutOfMemoryError(memory_type="CPU", cause=e)
+        _progress("transcribing", 1.0)
+
+        # Check for empty transcription
+        if not segments:
+            raise EmptyTranscriptionError(audio_duration=audio_info.duration_seconds)
 
         # Store pre-alignment segments (deep copy)
         self._pre_alignment_segments = [
@@ -188,12 +285,14 @@ class ChalnaPipeline:
         ]
 
         # Step 2: Qwen Forced Alignment (optional)
+        _progress("aligning", 0.0)
         if self.use_alignment and self._aligner and segments:
             if verbose:
                 print("\nForced Alignment:")
                 print("  [idx]   original_start → aligned_start (delta) | original_end → aligned_end (delta)")
                 print("  " + "-" * 80)
             segments = self._run_alignment(audio_path, segments, verbose=verbose)
+        _progress("aligning", 1.0)
 
         # Extract metadata
         speakers = list(set(s.speaker_id for s in segments if s.speaker_id))
@@ -401,8 +500,11 @@ class ChalnaPipeline:
 
             try:
                 # Extract exact segment audio (no buffer)
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                    tmp_path = tmp.name
+                try:
+                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                        tmp_path = tmp.name
+                except OSError as e:
+                    raise TempFileError(operation="create", cause=e)
 
                 subprocess.run([
                     "ffmpeg", "-y",

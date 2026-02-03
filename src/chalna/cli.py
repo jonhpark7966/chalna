@@ -11,6 +11,21 @@ import typer
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
+from chalna.exceptions import (
+    AudioTooLongError,
+    ChalnaError,
+    CorruptedFileError,
+    DiskSpaceError,
+    EmptyTranscriptionError,
+    FFmpegNotFoundError,
+    FilePermissionError,
+    ModelDownloadError,
+    ModelLoadError,
+    OutOfMemoryError,
+    TempFileError,
+    UnsupportedFormatError,
+)
+
 app = typer.Typer(
     name="chalna",
     help="찰나 (Chalna) - SRT subtitle generation with speaker diarization",
@@ -223,9 +238,117 @@ def transcribe(
         console.print()
         console.print(f"  Output saved to: {output}")
 
+    except AudioTooLongError as e:
+        console.print(f"[bold red]Error:[/bold red] Audio too long")
+        console.print(f"  Duration: {e.details['duration_seconds']:.1f}s")
+        console.print(f"  Maximum: {e.details['max_duration_seconds']:.0f}s (1 hour)")
+        console.print()
+        console.print("[dim]Tip: Split long audio files using ffmpeg:[/dim]")
+        console.print("[dim]  ffmpeg -i input.mp3 -ss 0 -t 3600 part1.mp3[/dim]")
+        raise typer.Exit(code=1)
+
+    except UnsupportedFormatError as e:
+        console.print(f"[bold red]Error:[/bold red] Unsupported format: {e.details['format']}")
+        console.print()
+        console.print("[dim]Supported formats:[/dim]")
+        console.print(f"[dim]  Audio: mp3, wav, flac, aac, ogg, opus, m4a, wma[/dim]")
+        console.print(f"[dim]  Video: mp4, mov, webm, mkv, avi[/dim]")
+        raise typer.Exit(code=1)
+
+    except CorruptedFileError as e:
+        console.print(f"[bold red]Error:[/bold red] Corrupted or unreadable file")
+        if e.details.get("reason"):
+            console.print(f"  Reason: {e.details['reason']}")
+        console.print()
+        console.print("[dim]Tip: Verify the file with ffprobe:[/dim]")
+        console.print(f"[dim]  ffprobe \"{input_file}\"[/dim]")
+        raise typer.Exit(code=1)
+
+    except FilePermissionError as e:
+        console.print(f"[bold red]Error:[/bold red] Permission denied")
+        console.print(f"  Cannot read: {e.details['file_path']}")
+        console.print()
+        console.print("[dim]Tip: Check file permissions[/dim]")
+        raise typer.Exit(code=1)
+
+    except OutOfMemoryError as e:
+        console.print(f"[bold red]Error:[/bold red] {e.details['memory_type']} memory exhausted")
+        console.print()
+        console.print("[dim]Suggestions:[/dim]")
+        console.print("  - Use shorter audio files")
+        if e.details['memory_type'] == "GPU":
+            console.print("  - Use --device cpu to run on CPU instead")
+            console.print("  - Close other GPU-intensive applications")
+        else:
+            console.print("  - Free up system memory")
+        raise typer.Exit(code=1)
+
+    except EmptyTranscriptionError as e:
+        console.print("[bold yellow]Warning:[/bold yellow] No speech detected in audio")
+        if e.details.get("audio_duration"):
+            console.print(f"  Audio duration: {e.details['audio_duration']:.1f}s")
+        console.print()
+        console.print("[dim]Possible causes:[/dim]")
+        console.print("  - Audio contains no speech")
+        console.print("  - Audio is too quiet")
+        console.print("  - Audio is heavily distorted")
+        raise typer.Exit(code=0)  # Exit 0 since this isn't an error per se
+
+    except ModelLoadError as e:
+        console.print(f"[bold red]Error:[/bold red] Failed to load model: {e.details['model_name']}")
+        if e.details.get("reason"):
+            console.print(f"  Reason: {e.details['reason']}")
+        console.print()
+        console.print("[dim]Suggestions:[/dim]")
+        console.print("  - Ensure model files are not corrupted")
+        console.print("  - Try clearing HuggingFace cache: rm -rf ~/.cache/huggingface")
+        raise typer.Exit(code=1)
+
+    except ModelDownloadError as e:
+        console.print(f"[bold red]Error:[/bold red] Failed to download model: {e.details['model_name']}")
+        console.print()
+        console.print("[dim]Suggestions:[/dim]")
+        console.print("  - Check your internet connection")
+        console.print("  - Try again later")
+        console.print("  - Set HF_HUB_OFFLINE=1 to use cached models")
+        raise typer.Exit(code=1)
+
+    except DiskSpaceError as e:
+        console.print("[bold red]Error:[/bold red] Insufficient disk space")
+        console.print(f"  Available: {e.details['available_mb']:.1f} MB")
+        console.print(f"  Required: {e.details['required_mb']:.1f} MB")
+        console.print()
+        console.print("[dim]Tip: Free up disk space and try again[/dim]")
+        raise typer.Exit(code=1)
+
+    except TempFileError as e:
+        console.print(f"[bold red]Error:[/bold red] Temporary file operation failed: {e.details['operation']}")
+        console.print()
+        console.print("[dim]Suggestions:[/dim]")
+        console.print("  - Check temp directory permissions")
+        console.print("  - Ensure sufficient disk space")
+        raise typer.Exit(code=1)
+
+    except FFmpegNotFoundError as e:
+        console.print(f"[bold red]Error:[/bold red] {e.details['tool']} not found")
+        console.print()
+        console.print("[dim]Installation instructions:[/dim]")
+        console.print("  Ubuntu/Debian: sudo apt install ffmpeg")
+        console.print("  macOS: brew install ffmpeg")
+        console.print("  Windows: choco install ffmpeg")
+        raise typer.Exit(code=1)
+
+    except ChalnaError as e:
+        # Catch-all for any other Chalna errors
+        console.print(f"[bold red]Error [{e.error_code.value}]:[/bold red] {e.message}")
+        if verbose and e.details:
+            console.print(f"  Details: {e.details}")
+        raise typer.Exit(code=1)
+
     except FileNotFoundError as e:
         console.print(f"[bold red]Error:[/bold red] {e}")
         raise typer.Exit(code=1)
+
     except Exception as e:
         console.print(f"[bold red]Error:[/bold red] {e}")
         if verbose:

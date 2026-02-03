@@ -10,14 +10,16 @@ import uuid
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Dict, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from chalna import __version__
+from chalna.exceptions import ChalnaError
+from chalna.validation import validate_audio_file
 
 
 # =============================================================================
@@ -37,6 +39,21 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# =============================================================================
+# Exception Handlers
+# =============================================================================
+
+
+@app.exception_handler(ChalnaError)
+async def chalna_error_handler(request: Request, exc: ChalnaError):
+    """Handle all Chalna-specific exceptions with structured error response."""
+    return JSONResponse(
+        status_code=exc.http_status,
+        content=exc.to_dict(),
+    )
+
 
 # Global pipeline instance (lazy loaded)
 _pipeline = None
@@ -73,7 +90,25 @@ class Job(BaseModel):
     completed_at: Optional[datetime] = None
     result: Optional[str] = None
     error: Optional[str] = None
+    error_details: Optional[Dict[str, Any]] = None
     output_format: str = "srt"
+    alignment_log: Optional[List[dict]] = None
+    progress_history: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class ErrorResponse(BaseModel):
+    """Structured error response."""
+    error: bool = True
+    error_code: str
+    error_type: str
+    message: str
+    details: Optional[Dict[str, Any]] = None
+
+
+class TranscriptionProgress(BaseModel):
+    """Progress update during transcription."""
+    stage: str  # "validating", "loading_models", "transcribing", "aligning"
+    progress: float  # 0.0 ~ 1.0
 
 
 class TranscribeResponse(BaseModel):
@@ -88,6 +123,9 @@ class JobResponse(BaseModel):
     progress: float
     result: Optional[str] = None
     error: Optional[str] = None
+    error_details: Optional[Dict[str, Any]] = None
+    alignment_log: Optional[List[dict]] = None
+    progress_history: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class HealthResponse(BaseModel):
@@ -162,11 +200,21 @@ async def transcribe(
     include_speaker: bool = Form(True, description="Include speaker labels"),
     use_alignment: bool = Form(True, description="Use Qwen forced alignment"),
     output_format: Literal["srt", "json"] = Form("srt", description="Output format"),
+    include_logs: bool = Form(False, description="Include alignment logs in JSON output"),
 ):
     """
     Transcribe audio/video file to subtitles (synchronous).
 
     Returns SRT or JSON based on output_format parameter.
+
+    Error responses follow the structure:
+    {
+        "error": true,
+        "error_code": "E1001",
+        "error_type": "AudioTooLongError",
+        "message": "Audio duration exceeds...",
+        "details": {...}
+    }
     """
     # Validate file
     if not file.filename:
@@ -180,6 +228,10 @@ async def transcribe(
         tmp_path = Path(tmp.name)
 
     try:
+        # Validate audio file first (duration, format, integrity)
+        # This will raise ChalnaError exceptions handled by the exception handler
+        validate_audio_file(tmp_path)
+
         # Get pipeline
         pipeline = get_pipeline()
         pipeline.use_alignment = use_alignment
@@ -193,8 +245,14 @@ async def transcribe(
 
         # Format output
         if output_format == "json":
+            response_data = result.to_dict()
+
+            # Include alignment logs if requested
+            if include_logs:
+                response_data["alignment_log"] = pipeline.get_alignment_log()
+
             return JSONResponse(
-                content=result.to_dict(),
+                content=response_data,
                 media_type="application/json",
             )
         else:
@@ -202,6 +260,10 @@ async def transcribe(
                 content=result.to_srt(include_speaker=include_speaker),
                 media_type="text/plain; charset=utf-8",
             )
+
+    except ChalnaError:
+        # Re-raise ChalnaError to be handled by the exception handler
+        raise
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -219,6 +281,7 @@ async def transcribe_async(
     include_speaker: bool = Form(True, description="Include speaker labels"),
     use_alignment: bool = Form(True, description="Use Qwen forced alignment"),
     output_format: Literal["srt", "json"] = Form("srt", description="Output format"),
+    include_logs: bool = Form(False, description="Include alignment logs in result"),
 ):
     """
     Transcribe audio/video file asynchronously (for long files).
@@ -235,6 +298,14 @@ async def transcribe_async(
         content = await file.read()
         tmp.write(content)
         tmp_path = Path(tmp.name)
+
+    # Validate audio file upfront (fail fast)
+    try:
+        validate_audio_file(tmp_path)
+    except ChalnaError:
+        # Cleanup and re-raise for exception handler
+        tmp_path.unlink(missing_ok=True)
+        raise
 
     # Create job
     job_id = str(uuid.uuid4())
@@ -256,6 +327,7 @@ async def transcribe_async(
             include_speaker=include_speaker,
             use_alignment=use_alignment,
             output_format=output_format,
+            include_logs=include_logs,
         )
     )
 
@@ -285,6 +357,9 @@ async def get_job(job_id: str):
         progress=job.progress,
         result=job.result,
         error=job.error,
+        error_details=job.error_details,
+        alignment_log=job.alignment_log,
+        progress_history=job.progress_history,
     )
 
 
@@ -300,19 +375,38 @@ async def _process_job(
     include_speaker: bool,
     use_alignment: bool,
     output_format: str,
+    include_logs: bool = False,
 ):
     """Process transcription job in background."""
     job = _jobs[job_id]
 
+    def progress_callback(stage: str, progress: float):
+        """Update job progress from pipeline."""
+        entry = {
+            "stage": stage,
+            "progress": progress,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+        job.progress_history.append(entry)
+
+        # Map stage progress to overall job progress
+        stage_weights = {
+            "validating": (0.0, 0.05),
+            "loading_models": (0.05, 0.3),
+            "transcribing": (0.3, 0.8),
+            "aligning": (0.8, 1.0),
+        }
+        if stage in stage_weights:
+            start, end = stage_weights[stage]
+            job.progress = start + (end - start) * progress
+
     try:
         job.status = JobStatus.PROCESSING
-        job.progress = 0.1
+        job.progress = 0.0
 
         # Get pipeline
         pipeline = get_pipeline()
         pipeline.use_alignment = use_alignment
-
-        job.progress = 0.3
 
         # Run transcription (in thread pool to not block)
         loop = asyncio.get_event_loop()
@@ -322,20 +416,34 @@ async def _process_job(
                 audio_path=audio_path,
                 context=context,
                 language=language,
+                progress_callback=progress_callback,
             )
         )
 
-        job.progress = 0.9
+        job.progress = 0.95
+
+        # Include alignment logs if requested
+        if include_logs:
+            job.alignment_log = pipeline.get_alignment_log()
 
         # Format output
         if output_format == "json":
-            job.result = result.to_json()
+            result_data = result.to_dict()
+            if include_logs:
+                result_data["alignment_log"] = job.alignment_log
+            import json
+            job.result = json.dumps(result_data, ensure_ascii=False, indent=2)
         else:
             job.result = result.to_srt(include_speaker=include_speaker)
 
         job.status = JobStatus.COMPLETED
         job.progress = 1.0
         job.completed_at = datetime.utcnow()
+
+    except ChalnaError as e:
+        job.status = JobStatus.FAILED
+        job.error = e.message
+        job.error_details = e.to_dict()
 
     except Exception as e:
         job.status = JobStatus.FAILED

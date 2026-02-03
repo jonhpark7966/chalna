@@ -6,7 +6,44 @@ VibeVoice ASR + Qwen Forced Alignment for accurate timestamps and speaker diariz
 
 __version__ = "0.1.0"
 
+from chalna.exceptions import (
+    AudioTooLongError,
+    ChalnaError,
+    CorruptedFileError,
+    DiskSpaceError,
+    EmptyTranscriptionError,
+    ErrorCode,
+    FFmpegNotFoundError,
+    FilePermissionError,
+    ModelDownloadError,
+    ModelLoadError,
+    OutOfMemoryError,
+    TempFileError,
+    UnsupportedFormatError,
+)
 from chalna.models import Segment, TranscriptionResult
 from chalna.pipeline import ChalnaPipeline
 
-__all__ = ["ChalnaPipeline", "Segment", "TranscriptionResult", "__version__"]
+__all__ = [
+    # Pipeline
+    "ChalnaPipeline",
+    # Models
+    "Segment",
+    "TranscriptionResult",
+    # Exceptions
+    "ChalnaError",
+    "ErrorCode",
+    "AudioTooLongError",
+    "UnsupportedFormatError",
+    "CorruptedFileError",
+    "FilePermissionError",
+    "OutOfMemoryError",
+    "EmptyTranscriptionError",
+    "ModelLoadError",
+    "ModelDownloadError",
+    "DiskSpaceError",
+    "TempFileError",
+    "FFmpegNotFoundError",
+    # Version
+    "__version__",
+]

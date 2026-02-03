@@ -256,11 +256,13 @@ class ChalnaPipeline:
                 with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
                     tmp_path = tmp.name
 
-                duration = seg.end_time - seg.start_time + 0.5  # Add buffer
+                buffer = 1.5  # seconds before and after
+                duration = seg.end_time - seg.start_time + buffer * 2
+                start_offset = max(0, seg.start_time - buffer)
                 subprocess.run([
                     "ffmpeg", "-y",
                     "-i", str(audio_path),
-                    "-ss", str(max(0, seg.start_time - 0.25)),
+                    "-ss", str(start_offset),
                     "-t", str(duration),
                     "-vn",
                     "-acodec", "pcm_s16le",
@@ -282,7 +284,7 @@ class ChalnaPipeline:
                     last_item = results[0][-1]
 
                     # Adjust relative to segment start
-                    offset = max(0, seg.start_time - 0.25)
+                    offset = start_offset
                     new_start = offset + first_item.start_time
                     new_end = offset + last_item.end_time
 

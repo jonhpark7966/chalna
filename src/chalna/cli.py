@@ -14,6 +14,8 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 from chalna.exceptions import (
     AudioTooLongError,
     ChalnaError,
+    CodexAPIError,
+    CodexRateLimitError,
     CorruptedFileError,
     DiskSpaceError,
     EmptyTranscriptionError,
@@ -67,6 +69,11 @@ def transcribe(
         False,
         "--no-align",
         help="Skip Qwen forced alignment (faster, less accurate timestamps)",
+    ),
+    llm_refine: bool = typer.Option(
+        True,
+        "--llm-refine/--no-llm-refine",
+        help="Use LLM to refine subtitles (requires Codex CLI)",
     ),
     json_output: bool = typer.Option(
         False,
@@ -127,6 +134,7 @@ def transcribe(
             pipeline = ChalnaPipeline(
                 device=device,
                 use_alignment=not no_align,
+                use_llm_refinement=llm_refine,
             )
 
             progress.update(task, description="Transcribing audio...")
@@ -141,45 +149,67 @@ def transcribe(
 
             progress.update(task, description="Writing output...")
 
-            # Save intermediate results if requested
+            # Save intermediate results (always save stage SRTs)
+            import json as json_module
+            from chalna.srt_utils import segments_to_srt
+
+            base_path = output.parent / output.stem
+
+            # Get intermediate results from result (thread-safe)
+            intermediate = result.intermediate
+
+            # Stage 1: Raw segments (VibeVoice)
+            raw_segments = intermediate.raw_segments if intermediate else None
+            if raw_segments:
+                raw_srt_path = base_path.parent / f"{base_path.name}_1_raw.srt"
+                raw_srt_content = segments_to_srt(raw_segments, include_speaker=True)
+                raw_srt_path.write_text(raw_srt_content, encoding="utf-8")
+                console.print(f"  Raw SRT: {raw_srt_path}")
+
+            # Stage 2: Aligned segments (Qwen)
+            aligned_segments = intermediate.aligned_segments if intermediate else None
+            if aligned_segments:
+                aligned_srt_path = base_path.parent / f"{base_path.name}_2_aligned.srt"
+                aligned_srt_content = segments_to_srt(aligned_segments, include_speaker=True)
+                aligned_srt_path.write_text(aligned_srt_content, encoding="utf-8")
+                console.print(f"  Aligned SRT: {aligned_srt_path}")
+
+            # Stage 3: Refined segments (LLM)
+            refined_segments = intermediate.refined_segments if intermediate else None
+            if refined_segments:
+                refined_srt_path = base_path.parent / f"{base_path.name}_3_refined.srt"
+                refined_srt_content = segments_to_srt(refined_segments, include_speaker=True)
+                refined_srt_path.write_text(refined_srt_content, encoding="utf-8")
+                console.print(f"  Refined SRT: {refined_srt_path}")
+
+            # Save detailed logs only if --save-intermediate is set
             if save_intermediate:
-                import json as json_module
-                from chalna.srt_utils import segments_to_srt
+                from chalna.models import TranscriptionResult, TranscriptionMetadata
 
-                base_path = output.parent / output.stem
-
-                # Save pre-alignment SRT
-                pre_segments = pipeline.get_pre_alignment_segments()
-                if pre_segments:
-                    pre_srt_path = base_path.parent / f"{base_path.name}_pre_align.srt"
-                    pre_srt_content = segments_to_srt(pre_segments, include_speaker=True)
-                    pre_srt_path.write_text(pre_srt_content, encoding="utf-8")
-                    console.print(f"  Pre-alignment SRT: {pre_srt_path}")
-
-                    # Save pre-alignment JSON
-                    pre_json_path = base_path.parent / f"{base_path.name}_pre_align.json"
-                    from chalna.models import TranscriptionResult, TranscriptionMetadata
+                # Save pre-alignment JSON
+                if raw_segments:
+                    pre_json_path = base_path.parent / f"{base_path.name}_1_raw.json"
                     pre_result = TranscriptionResult(
-                        segments=pre_segments,
+                        segments=raw_segments,
                         metadata=TranscriptionMetadata(
-                            duration=max((s.end_time for s in pre_segments), default=0.0),
+                            duration=max((s.end_time for s in raw_segments), default=0.0),
                             language=language,
-                            speakers=list(set(s.speaker_id for s in pre_segments if s.speaker_id)),
+                            speakers=list(set(s.speaker_id for s in raw_segments if s.speaker_id)),
                             model_version="vibevoice-asr",
                             aligned=False,
                         )
                     )
                     pre_json_path.write_text(pre_result.to_json(), encoding="utf-8")
-                    console.print(f"  Pre-alignment JSON: {pre_json_path}")
+                    console.print(f"  Raw JSON: {pre_json_path}")
 
                 # Save alignment log
-                alignment_log = pipeline.get_alignment_log()
+                alignment_log = intermediate.alignment_log if intermediate else None
                 if alignment_log:
                     log_path = base_path.parent / f"{base_path.name}_alignment.log"
                     log_lines = []
                     for entry in alignment_log:
                         status = entry["status"]
-                        idx = entry["index"]
+                        idx = entry.get("index", 0)
                         text = entry.get("text", "")
                         orig = entry.get("original", {})
 
@@ -192,7 +222,6 @@ def transcribe(
                                 f"({entry['delta']['end']:+.2f}s) | {text}"
                             )
                         elif status == "rejected_expand":
-                            att = entry.get("attempted", {})
                             log_lines.append(
                                 f"[{idx:3d}] REJECTED: would expand - kept original "
                                 f"{orig['start']:.2f}→{orig['end']:.2f} | {text}"
@@ -218,6 +247,16 @@ def transcribe(
                             )
                     log_path.write_text("\n".join(log_lines), encoding="utf-8")
                     console.print(f"  Alignment log: {log_path}")
+
+                # Save refinement log
+                refinement_log = intermediate.refinement_log if intermediate else None
+                if refinement_log:
+                    refine_log_path = base_path.parent / f"{base_path.name}_refinement.json"
+                    refine_log_path.write_text(
+                        json_module.dumps(refinement_log, indent=2, ensure_ascii=False),
+                        encoding="utf-8"
+                    )
+                    console.print(f"  Refinement log: {refine_log_path}")
 
         # Generate output
         if json_output:
@@ -321,6 +360,24 @@ def transcribe(
         console.print("  - Check your internet connection")
         console.print("  - Try again later")
         console.print("  - Set HF_HUB_OFFLINE=1 to use cached models")
+        raise typer.Exit(code=1)
+
+    except CodexAPIError as e:
+        console.print(f"[bold red]Error:[/bold red] Codex CLI failed")
+        console.print(f"  Reason: {e.details['reason']}")
+        console.print()
+        console.print("[dim]Suggestions:[/dim]")
+        console.print("  - Check that Codex CLI is installed: npm install -g @anthropic-ai/codex")
+        console.print("  - Run with --no-llm-refine to skip LLM refinement")
+        raise typer.Exit(code=1)
+
+    except CodexRateLimitError as e:
+        console.print(f"[bold red]Error:[/bold red] Codex API rate limit exceeded")
+        console.print(f"  Reason: {e.details['reason']}")
+        console.print()
+        console.print("[dim]Suggestions:[/dim]")
+        console.print("  - Wait and try again later")
+        console.print("  - Run with --no-llm-refine to skip LLM refinement")
         raise typer.Exit(code=1)
 
     except DiskSpaceError as e:

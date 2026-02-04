@@ -13,13 +13,15 @@ from typing import Callable, List, Optional
 import torch
 
 from chalna.exceptions import (
+    CodexAPIError,
+    CodexRateLimitError,
     EmptyTranscriptionError,
     ModelDownloadError,
     ModelLoadError,
     OutOfMemoryError,
     TempFileError,
 )
-from chalna.models import Segment, TranscriptionMetadata, TranscriptionResult
+from chalna.models import IntermediateResults, Segment, TranscriptionMetadata, TranscriptionResult
 from chalna.validation import (
     check_disk_space,
     estimate_temp_space_required,
@@ -41,6 +43,7 @@ class ChalnaPipeline:
         device: str = "auto",
         dtype: Optional[torch.dtype] = None,
         use_alignment: bool = True,
+        use_llm_refinement: bool = True,
         vibevoice_path: str = "microsoft/VibeVoice-ASR",
         aligner_path: str = "Qwen/Qwen3-ForcedAligner-0.6B",
     ):
@@ -51,12 +54,14 @@ class ChalnaPipeline:
             device: Device to use (cuda, cpu, mps, xpu, auto)
             dtype: Data type for models (None for auto)
             use_alignment: Whether to use Qwen forced alignment
+            use_llm_refinement: Whether to use LLM-based subtitle refinement (requires Codex CLI)
             vibevoice_path: Path or HuggingFace ID for VibeVoice model
             aligner_path: Path or HuggingFace ID for Qwen aligner model
         """
         self.device = self._resolve_device(device)
         self.dtype = dtype or self._resolve_dtype()
         self.use_alignment = use_alignment
+        self.use_llm_refinement = use_llm_refinement
         self.vibevoice_path = vibevoice_path
         self.aligner_path = aligner_path
 
@@ -65,9 +70,15 @@ class ChalnaPipeline:
         self._vibevoice_processor = None
         self._aligner = None
 
-        # Results storage
+        # Results storage - intermediate stages
         self._last_alignment_log = []
-        self._pre_alignment_segments = None
+        self._pre_alignment_segments = None  # Alias for _raw_segments
+
+        # Stage-specific intermediate results (always stored)
+        self._raw_segments: Optional[List[Segment]] = None  # Stage 1: VibeVoice raw
+        self._aligned_segments: Optional[List[Segment]] = None  # Stage 2: After forced alignment
+        self._refined_segments: Optional[List[Segment]] = None  # Stage 3: After LLM refinement (before re-align)
+        self._refinement_log: Optional[List[dict]] = None  # LLM refinement operation log
 
     def _resolve_device(self, device: str) -> str:
         """Resolve device string to actual device."""
@@ -271,8 +282,33 @@ class ChalnaPipeline:
         if not segments:
             raise EmptyTranscriptionError(audio_duration=audio_info.duration_seconds)
 
-        # Store pre-alignment segments (deep copy)
-        self._pre_alignment_segments = [
+        # Store raw segments (Stage 1)
+        self._raw_segments = [
+            Segment(
+                index=s.index,
+                start_time=s.start_time,
+                end_time=s.end_time,
+                text=s.text,
+                speaker_id=s.speaker_id,
+                confidence=s.confidence,
+            )
+            for s in segments
+        ]
+        # Keep backward compatibility
+        self._pre_alignment_segments = self._raw_segments
+
+        # Step 2: Qwen Forced Alignment (optional)
+        _progress("aligning", 0.0)
+        if self.use_alignment and self._aligner and segments:
+            if verbose:
+                print("\nForced Alignment:")
+                print("  [idx]   original_start → aligned_start (delta) | original_end → aligned_end (delta)")
+                print("  " + "-" * 80)
+            segments = self._run_alignment(audio_path, segments, verbose=verbose)
+        _progress("aligning", 1.0)
+
+        # Store aligned segments (Stage 2)
+        self._aligned_segments = [
             Segment(
                 index=s.index,
                 start_time=s.start_time,
@@ -284,15 +320,34 @@ class ChalnaPipeline:
             for s in segments
         ]
 
-        # Step 2: Qwen Forced Alignment (optional)
-        _progress("aligning", 0.0)
-        if self.use_alignment and self._aligner and segments:
-            if verbose:
-                print("\nForced Alignment:")
-                print("  [idx]   original_start → aligned_start (delta) | original_end → aligned_end (delta)")
-                print("  " + "-" * 80)
-            segments = self._run_alignment(audio_path, segments, verbose=verbose)
-        _progress("aligning", 1.0)
+        # Step 3: LLM Refinement (optional)
+        if self.use_llm_refinement:
+            _progress("refining", 0.0)
+            try:
+                segments, self._refinement_log = self._run_llm_refinement(
+                    segments=segments,
+                    audio_path=audio_path,
+                    context=context,
+                    progress_callback=progress_callback,
+                    verbose=verbose,
+                )
+                # Store refined segments (Stage 3 - before final re-alignment)
+                self._refined_segments = [
+                    Segment(
+                        index=s.index,
+                        start_time=s.start_time,
+                        end_time=s.end_time,
+                        text=s.text,
+                        speaker_id=s.speaker_id,
+                        confidence=s.confidence,
+                    )
+                    for s in segments
+                ]
+            except (CodexAPIError, CodexRateLimitError) as e:
+                if verbose:
+                    print(f"\nLLM refinement skipped: {e.message}")
+                self._refinement_log = [{"status": "skipped", "error": str(e)}]
+            _progress("refining", 1.0)
 
         # Extract metadata
         speakers = list(set(s.speaker_id for s in segments if s.speaker_id))
@@ -306,15 +361,44 @@ class ChalnaPipeline:
             aligned=self.use_alignment and self._aligner is not None,
         )
 
-        return TranscriptionResult(segments=segments, metadata=metadata)
+        # Build intermediate results (thread-safe, per-request)
+        intermediate = IntermediateResults(
+            raw_segments=self._raw_segments,
+            aligned_segments=self._aligned_segments,
+            refined_segments=self._refined_segments,
+            alignment_log=self._last_alignment_log,
+            refinement_log=self._refinement_log,
+        )
+
+        return TranscriptionResult(
+            segments=segments,
+            metadata=metadata,
+            intermediate=intermediate,
+        )
 
     def get_pre_alignment_segments(self) -> Optional[List[Segment]]:
-        """Get segments before forced alignment was applied."""
+        """Get segments before forced alignment was applied (alias for get_raw_segments)."""
         return self._pre_alignment_segments
 
     def get_alignment_log(self) -> List[dict]:
         """Get detailed log of alignment adjustments."""
         return self._last_alignment_log
+
+    def get_raw_segments(self) -> Optional[List[Segment]]:
+        """Get raw VibeVoice segments (Stage 1, before alignment)."""
+        return self._raw_segments
+
+    def get_aligned_segments(self) -> Optional[List[Segment]]:
+        """Get segments after forced alignment (Stage 2)."""
+        return self._aligned_segments
+
+    def get_refined_segments(self) -> Optional[List[Segment]]:
+        """Get segments after LLM refinement (Stage 3, before final re-alignment)."""
+        return self._refined_segments
+
+    def get_refinement_log(self) -> Optional[List[dict]]:
+        """Get LLM refinement operation log."""
+        return self._refinement_log
 
     def align_segments(
         self,
@@ -462,6 +546,364 @@ class ChalnaPipeline:
 
         print(f"Failed to parse transcription output. Raw length: {len(raw_output)}")
         return []
+
+    def _run_llm_refinement(
+        self,
+        segments: List[Segment],
+        audio_path: Path,
+        context: Optional[str],
+        progress_callback: Optional[Callable[[str, float], None]],
+        verbose: bool = True,
+    ) -> tuple:
+        """
+        Run LLM refinement and re-alignment for split segments.
+
+        Args:
+            segments: List of aligned segments
+            audio_path: Path to audio file
+            context: Optional context/script for reference
+            progress_callback: Optional callback for progress updates
+            verbose: Whether to print detailed logs
+
+        Returns:
+            (refined_segments, refinement_log)
+        """
+        from chalna.llm_refiner import refine_segments
+
+        if verbose:
+            print("\nLLM Refinement:")
+            print("  " + "-" * 80)
+
+        # Step 1: LLM refinement
+        def refine_progress(stage: str, value: float):
+            if progress_callback:
+                # Refining takes first 50% of this stage
+                progress_callback("refining", value * 0.5)
+
+        output = refine_segments(
+            segments=segments,
+            context=context,
+            progress_callback=refine_progress,
+        )
+
+        refined_segments = list(output.segments)  # Make mutable copy
+        log = output.log
+        origin_map = output.origin_map
+
+        if verbose:
+            # Print summary
+            split_count = sum(1 for entry in log if entry.get("status") == "split")
+            refined_count = sum(1 for entry in log if entry.get("status") == "refined")
+            error_count = sum(1 for entry in log if entry.get("status") == "error")
+            parse_error_count = sum(1 for entry in log if entry.get("status") == "parse_error")
+            print(f"  Split: {split_count}, Refined: {refined_count}, Errors: {error_count}, Parse errors: {parse_error_count}")
+
+        # Step 2: Re-align segments using origin_map and log
+        # Build lookup: original_index -> log entry for quick access
+        log_by_original_idx = {}
+        for entry in log:
+            orig_idx = entry.get("original_index")
+            if orig_idx is not None:
+                log_by_original_idx[orig_idx] = entry
+
+        # Identify segments needing re-alignment (by new segment index)
+        single_realign_indices = []  # For non-split segments that need realignment
+        split_groups = []  # For split segments: (original_start, original_end, [new_indices], [texts])
+
+        for new_idx, orig_idx in origin_map.items():
+            entry = log_by_original_idx.get(orig_idx)
+            if entry is None:
+                continue
+
+            if entry.get("status") == "split":
+                # Collect all new indices for this split group
+                new_indices = entry.get("new_segment_indices", [])
+                if new_idx == new_indices[0]:  # Only process once per split group
+                    split_groups.append({
+                        "original_start": entry.get("original_start"),
+                        "original_end": entry.get("original_end"),
+                        "new_indices": new_indices,
+                        "texts": entry.get("split_texts", []),
+                        "speaker_id": refined_segments[new_indices[0]].speaker_id if new_indices else None,
+                        "confidence": refined_segments[new_indices[0]].confidence if new_indices else 1.0,
+                    })
+            elif entry.get("needs_realignment"):
+                single_realign_indices.append(new_idx)
+
+        total_realign_count = len(single_realign_indices) + len(split_groups)
+
+        if total_realign_count > 0 and self._aligner:
+            if verbose:
+                print(f"  Re-aligning: {len(single_realign_indices)} single segments, {len(split_groups)} split groups")
+
+            if progress_callback:
+                progress_callback("refining", 0.5)
+
+            realign_done = 0
+
+            # Re-align single segments
+            for new_idx in single_realign_indices:
+                seg = refined_segments[new_idx]
+                try:
+                    aligned = self._align_single_segment(seg, audio_path)
+                    if aligned:
+                        refined_segments[new_idx] = aligned
+                except Exception as e:
+                    log.append({
+                        "new_segment_index": new_idx,
+                        "status": "realign_failed",
+                        "error": str(e),
+                    })
+                    if verbose:
+                        print(f"    Re-align failed for segment {seg.index}: {e}")
+
+                realign_done += 1
+                if progress_callback:
+                    progress_callback("refining", 0.5 + 0.5 * realign_done / total_realign_count)
+
+            # Re-align split groups using full original audio slice
+            for group in split_groups:
+                try:
+                    aligned_splits = self._align_split_segments(
+                        audio_path=audio_path,
+                        original_start=group["original_start"],
+                        original_end=group["original_end"],
+                        split_texts=group["texts"],
+                        speaker_id=group["speaker_id"],
+                        confidence=group["confidence"],
+                    )
+                    if aligned_splits:
+                        for i, new_idx in enumerate(group["new_indices"]):
+                            if i < len(aligned_splits):
+                                refined_segments[new_idx] = aligned_splits[i]
+                except Exception as e:
+                    log.append({
+                        "new_segment_indices": group["new_indices"],
+                        "status": "split_realign_failed",
+                        "error": str(e),
+                    })
+                    if verbose:
+                        print(f"    Split re-align failed: {e}")
+
+                realign_done += 1
+                if progress_callback:
+                    progress_callback("refining", 0.5 + 0.5 * realign_done / total_realign_count)
+
+        # Step 3: Fix overlapping timestamps
+        refined_segments = self._fix_overlapping_timestamps(refined_segments, verbose=verbose)
+
+        # Re-index all segments
+        for i, seg in enumerate(refined_segments, start=1):
+            seg.index = i
+
+        return refined_segments, log
+
+    def _align_split_segments(
+        self,
+        audio_path: Path,
+        original_start: float,
+        original_end: float,
+        split_texts: List[str],
+        speaker_id: Optional[str],
+        confidence: float,
+    ) -> Optional[List[Segment]]:
+        """
+        Align split segments using word-level alignment on the full original audio slice.
+
+        Instead of aligning each split part on its equal-duration placeholder,
+        we align the entire combined text against the original audio and derive
+        boundaries from word timestamps.
+
+        Args:
+            audio_path: Path to full audio file
+            original_start: Start time of original segment
+            original_end: End time of original segment
+            split_texts: List of text parts after splitting
+            speaker_id: Speaker ID for all parts
+            confidence: Confidence score for all parts
+
+        Returns:
+            List of aligned Segment objects, or None if alignment fails
+        """
+        import subprocess
+
+        if not self._aligner:
+            return None
+
+        original_duration = original_end - original_start
+        if original_duration < 0.1:
+            return None
+
+        try:
+            # Extract original segment audio
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                tmp_path = tmp.name
+
+            subprocess.run([
+                "ffmpeg", "-y",
+                "-i", str(audio_path),
+                "-ss", str(original_start),
+                "-t", str(original_duration),
+                "-vn",
+                "-acodec", "pcm_s16le",
+                "-ar", "16000",
+                "-ac", "1",
+                tmp_path,
+            ], capture_output=True, check=True)
+
+            # Combine all split texts for alignment
+            combined_text = " ".join(split_texts)
+
+            # Run word-level alignment on combined text
+            results = self._aligner.align(
+                audio=tmp_path,
+                text=combined_text,
+                language="Korean",
+            )
+
+            Path(tmp_path).unlink(missing_ok=True)
+
+            if not results or len(results) == 0 or len(results[0]) == 0:
+                return None
+
+            words = results[0]
+
+            # Find boundaries for each split text using character positions
+            aligned_segments = []
+            current_char_pos = 0
+            current_word_idx = 0
+
+            for i, text in enumerate(split_texts):
+                text_no_space = text.replace(" ", "")
+                text_len = len(text_no_space)
+
+                if text_len == 0:
+                    continue
+
+                # Find start word for this text part
+                start_word_idx = current_word_idx
+
+                # Find end word by counting characters
+                chars_counted = 0
+                end_word_idx = start_word_idx
+
+                while end_word_idx < len(words) and chars_counted < text_len:
+                    word_text = words[end_word_idx].text.replace(" ", "")
+                    chars_counted += len(word_text)
+                    end_word_idx += 1
+
+                if start_word_idx >= len(words):
+                    break
+
+                # Get timestamps
+                start_time = original_start + words[start_word_idx].start_time
+                end_time = original_start + words[min(end_word_idx - 1, len(words) - 1)].end_time
+
+                # Ensure valid duration
+                if end_time <= start_time:
+                    end_time = start_time + 0.1
+
+                # Clamp to original bounds
+                start_time = max(start_time, original_start)
+                end_time = min(end_time, original_end)
+
+                aligned_segments.append(Segment(
+                    index=i + 1,  # Will be re-indexed later
+                    start_time=start_time,
+                    end_time=end_time,
+                    text=text,
+                    speaker_id=speaker_id,
+                    confidence=confidence,
+                ))
+
+                current_word_idx = end_word_idx
+
+            return aligned_segments if aligned_segments else None
+
+        except Exception:
+            return None
+
+    def _align_single_segment(
+        self,
+        segment: Segment,
+        audio_path: Path,
+    ) -> Optional[Segment]:
+        """
+        Run forced alignment on a single segment.
+
+        Args:
+            segment: Segment to align
+            audio_path: Path to full audio file
+
+        Returns:
+            Aligned segment or None if alignment fails
+        """
+        import subprocess
+
+        if not self._aligner:
+            return None
+
+        original_start = segment.start_time
+        original_end = segment.end_time
+        original_duration = original_end - original_start
+
+        if original_duration < 0.1:
+            return None
+
+        try:
+            # Extract segment audio
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                tmp_path = tmp.name
+
+            subprocess.run([
+                "ffmpeg", "-y",
+                "-i", str(audio_path),
+                "-ss", str(original_start),
+                "-t", str(original_duration),
+                "-vn",
+                "-acodec", "pcm_s16le",
+                "-ar", "16000",
+                "-ac", "1",
+                tmp_path,
+            ], capture_output=True, check=True)
+
+            # Run alignment
+            results = self._aligner.align(
+                audio=tmp_path,
+                text=segment.text,
+                language="Korean",
+            )
+
+            Path(tmp_path).unlink(missing_ok=True)
+
+            if not results or len(results) == 0 or len(results[0]) == 0:
+                return None
+
+            first_item = results[0][0]
+            last_item = results[0][-1]
+
+            new_start = original_start + first_item.start_time
+            new_end = original_start + last_item.end_time
+
+            # Validate duration
+            if new_end - new_start < 0.05:
+                return None
+
+            # Tighten to original bounds
+            new_start = max(new_start, original_start)
+            new_end = min(new_end, original_end)
+
+            return Segment(
+                index=segment.index,
+                start_time=new_start,
+                end_time=new_end,
+                text=segment.text,
+                speaker_id=segment.speaker_id,
+                confidence=segment.confidence,
+            )
+
+        except Exception:
+            return None
 
     def _split_into_sentences(self, text: str) -> List[str]:
         """

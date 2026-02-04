@@ -93,7 +93,12 @@ class Job(BaseModel):
     error_details: Optional[Dict[str, Any]] = None
     output_format: str = "srt"
     alignment_log: Optional[List[dict]] = None
+    refinement_log: Optional[List[dict]] = None
     progress_history: List[Dict[str, Any]] = Field(default_factory=list)
+    # Intermediate results
+    raw_srt: Optional[str] = None  # Stage 1: VibeVoice raw
+    aligned_srt: Optional[str] = None  # Stage 2: After forced alignment
+    refined_srt: Optional[str] = None  # Stage 3: After LLM refinement
 
 
 class ErrorResponse(BaseModel):
@@ -125,7 +130,12 @@ class JobResponse(BaseModel):
     error: Optional[str] = None
     error_details: Optional[Dict[str, Any]] = None
     alignment_log: Optional[List[dict]] = None
+    refinement_log: Optional[List[dict]] = None
     progress_history: List[Dict[str, Any]] = Field(default_factory=list)
+    # Intermediate results
+    raw_srt: Optional[str] = None
+    aligned_srt: Optional[str] = None
+    refined_srt: Optional[str] = None
 
 
 class HealthResponse(BaseModel):
@@ -199,8 +209,10 @@ async def transcribe(
     language: Optional[str] = Form(None, description="Language hint (ko, en, ja, zh)"),
     include_speaker: bool = Form(True, description="Include speaker labels"),
     use_alignment: bool = Form(True, description="Use Qwen forced alignment"),
+    use_llm_refinement: bool = Form(True, description="Use LLM to refine subtitles"),
     output_format: Literal["srt", "json"] = Form("srt", description="Output format"),
-    include_logs: bool = Form(False, description="Include alignment logs in JSON output"),
+    include_logs: bool = Form(False, description="Include alignment/refinement logs in JSON output"),
+    include_intermediate: bool = Form(False, description="Include intermediate stage results"),
 ):
     """
     Transcribe audio/video file to subtitles (synchronous).
@@ -235,6 +247,7 @@ async def transcribe(
         # Get pipeline
         pipeline = get_pipeline()
         pipeline.use_alignment = use_alignment
+        pipeline.use_llm_refinement = use_llm_refinement
 
         # Run transcription
         result = pipeline.transcribe(
@@ -247,9 +260,29 @@ async def transcribe(
         if output_format == "json":
             response_data = result.to_dict()
 
-            # Include alignment logs if requested
-            if include_logs:
-                response_data["alignment_log"] = pipeline.get_alignment_log()
+            # Include logs if requested (use result.intermediate for thread safety)
+            if include_logs and result.intermediate:
+                response_data["alignment_log"] = result.intermediate.alignment_log
+                response_data["refinement_log"] = result.intermediate.refinement_log
+
+            # Include intermediate results if requested
+            if include_intermediate and result.intermediate:
+                from chalna.srt_utils import segments_to_srt
+
+                if result.intermediate.raw_segments:
+                    response_data["raw_srt"] = segments_to_srt(
+                        result.intermediate.raw_segments, include_speaker=True
+                    )
+
+                if result.intermediate.aligned_segments:
+                    response_data["aligned_srt"] = segments_to_srt(
+                        result.intermediate.aligned_segments, include_speaker=True
+                    )
+
+                if result.intermediate.refined_segments:
+                    response_data["refined_srt"] = segments_to_srt(
+                        result.intermediate.refined_segments, include_speaker=True
+                    )
 
             return JSONResponse(
                 content=response_data,
@@ -280,8 +313,10 @@ async def transcribe_async(
     language: Optional[str] = Form(None, description="Language hint (ko, en, ja, zh)"),
     include_speaker: bool = Form(True, description="Include speaker labels"),
     use_alignment: bool = Form(True, description="Use Qwen forced alignment"),
+    use_llm_refinement: bool = Form(True, description="Use LLM to refine subtitles"),
     output_format: Literal["srt", "json"] = Form("srt", description="Output format"),
-    include_logs: bool = Form(False, description="Include alignment logs in result"),
+    include_logs: bool = Form(False, description="Include alignment/refinement logs in result"),
+    include_intermediate: bool = Form(False, description="Include intermediate stage results"),
 ):
     """
     Transcribe audio/video file asynchronously (for long files).
@@ -326,8 +361,10 @@ async def transcribe_async(
             language=language,
             include_speaker=include_speaker,
             use_alignment=use_alignment,
+            use_llm_refinement=use_llm_refinement,
             output_format=output_format,
             include_logs=include_logs,
+            include_intermediate=include_intermediate,
         )
     )
 
@@ -359,7 +396,11 @@ async def get_job(job_id: str):
         error=job.error,
         error_details=job.error_details,
         alignment_log=job.alignment_log,
+        refinement_log=job.refinement_log,
         progress_history=job.progress_history,
+        raw_srt=job.raw_srt,
+        aligned_srt=job.aligned_srt,
+        refined_srt=job.refined_srt,
     )
 
 
@@ -374,8 +415,10 @@ async def _process_job(
     language: Optional[str],
     include_speaker: bool,
     use_alignment: bool,
+    use_llm_refinement: bool,
     output_format: str,
     include_logs: bool = False,
+    include_intermediate: bool = False,
 ):
     """Process transcription job in background."""
     job = _jobs[job_id]
@@ -392,9 +435,10 @@ async def _process_job(
         # Map stage progress to overall job progress
         stage_weights = {
             "validating": (0.0, 0.05),
-            "loading_models": (0.05, 0.3),
-            "transcribing": (0.3, 0.8),
-            "aligning": (0.8, 1.0),
+            "loading_models": (0.05, 0.25),
+            "transcribing": (0.25, 0.55),
+            "aligning": (0.55, 0.75),
+            "refining": (0.75, 0.95),
         }
         if stage in stage_weights:
             start, end = stage_weights[stage]
@@ -407,6 +451,7 @@ async def _process_job(
         # Get pipeline
         pipeline = get_pipeline()
         pipeline.use_alignment = use_alignment
+        pipeline.use_llm_refinement = use_llm_refinement
 
         # Run transcription (in thread pool to not block)
         loop = asyncio.get_event_loop()
@@ -422,15 +467,40 @@ async def _process_job(
 
         job.progress = 0.95
 
-        # Include alignment logs if requested
-        if include_logs:
-            job.alignment_log = pipeline.get_alignment_log()
+        # Include logs if requested (use result.intermediate for thread safety)
+        if include_logs and result.intermediate:
+            job.alignment_log = result.intermediate.alignment_log
+            job.refinement_log = result.intermediate.refinement_log
+
+        # Include intermediate results if requested
+        if include_intermediate and result.intermediate:
+            from chalna.srt_utils import segments_to_srt
+
+            if result.intermediate.raw_segments:
+                job.raw_srt = segments_to_srt(
+                    result.intermediate.raw_segments, include_speaker=True
+                )
+
+            if result.intermediate.aligned_segments:
+                job.aligned_srt = segments_to_srt(
+                    result.intermediate.aligned_segments, include_speaker=True
+                )
+
+            if result.intermediate.refined_segments:
+                job.refined_srt = segments_to_srt(
+                    result.intermediate.refined_segments, include_speaker=True
+                )
 
         # Format output
         if output_format == "json":
             result_data = result.to_dict()
             if include_logs:
                 result_data["alignment_log"] = job.alignment_log
+                result_data["refinement_log"] = job.refinement_log
+            if include_intermediate:
+                result_data["raw_srt"] = job.raw_srt
+                result_data["aligned_srt"] = job.aligned_srt
+                result_data["refined_srt"] = job.refined_srt
             import json
             job.result = json.dumps(result_data, ensure_ascii=False, indent=2)
         else:

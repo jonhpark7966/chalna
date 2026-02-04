@@ -27,6 +27,8 @@ class ErrorCode(str, Enum):
 
     # Network (3xxx)
     MODEL_DOWNLOAD_FAILED = "E3001"
+    CODEX_API_ERROR = "E3002"
+    CODEX_RATE_LIMIT = "E3003"
 
     # System (4xxx)
     DISK_SPACE_ERROR = "E4001"
@@ -274,6 +276,40 @@ class ModelDownloadError(ChalnaError):
             "model_name": model_name,
         }
         super().__init__(message, details, cause)
+
+
+class CodexAPIError(ChalnaError):
+    """Raised when Codex CLI API call fails."""
+
+    error_code = ErrorCode.CODEX_API_ERROR
+    http_status = 503
+
+    def __init__(
+        self,
+        message: str,
+        cause: Optional[Exception] = None,
+    ):
+        details = {
+            "reason": message,
+        }
+        super().__init__(message, details, cause)
+
+
+class CodexRateLimitError(ChalnaError):
+    """Raised when Codex API rate limit or quota is exceeded."""
+
+    error_code = ErrorCode.CODEX_RATE_LIMIT
+    http_status = 429
+
+    def __init__(
+        self,
+        message: str,
+    ):
+        full_message = f"Codex API 사용량 초과: {message}"
+        details = {
+            "reason": message,
+        }
+        super().__init__(full_message, details)
 
 
 # =============================================================================

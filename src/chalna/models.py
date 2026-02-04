@@ -55,11 +55,42 @@ class TranscriptionMetadata:
 
 
 @dataclass
+class IntermediateResults:
+    """Intermediate results from each pipeline stage."""
+
+    # Stage 1: Raw VibeVoice output (before alignment)
+    raw_segments: Optional[List[Segment]] = None
+    # Stage 2: After Qwen forced alignment
+    aligned_segments: Optional[List[Segment]] = None
+    # Stage 3: After LLM refinement (before final re-alignment)
+    refined_segments: Optional[List[Segment]] = None
+    # Logs
+    alignment_log: Optional[List[dict]] = None
+    refinement_log: Optional[List[dict]] = None
+
+    def to_dict(self) -> dict:
+        result = {}
+        if self.raw_segments:
+            result["raw_segments"] = [s.to_dict() for s in self.raw_segments]
+        if self.aligned_segments:
+            result["aligned_segments"] = [s.to_dict() for s in self.aligned_segments]
+        if self.refined_segments:
+            result["refined_segments"] = [s.to_dict() for s in self.refined_segments]
+        if self.alignment_log:
+            result["alignment_log"] = self.alignment_log
+        if self.refinement_log:
+            result["refinement_log"] = self.refinement_log
+        return result
+
+
+@dataclass
 class TranscriptionResult:
     """Complete transcription result."""
 
     segments: List[Segment]
     metadata: TranscriptionMetadata
+    # Intermediate results (thread-safe, per-request)
+    intermediate: Optional[IntermediateResults] = None
 
     def to_dict(self) -> dict:
         return {

@@ -83,7 +83,7 @@ def create_app(device: str = "auto") -> gr.Blocks:
         nonlocal pipeline
 
         if audio_file is None:
-            return "파일을 업로드해주세요.", None, ""
+            return "파일을 업로드해주세요.", None, None, None, None, ""
 
         start_time = time.time()
 
@@ -97,7 +97,7 @@ def create_app(device: str = "auto") -> gr.Blocks:
             # Lazy load pipeline
             if pipeline is None:
                 progress(0, desc=f"[{elapsed()}] 모델 로딩 중... (첫 실행 시 1-2분 소요)")
-                pipeline = ChalnaPipeline(device=device, use_alignment=True)
+                pipeline = ChalnaPipeline(device=device, use_alignment=True, use_llm_refinement=True)
 
             progress(0.05, desc=f"[{elapsed()}] 오디오 검증 중...")
 
@@ -105,8 +105,9 @@ def create_app(device: str = "auto") -> gr.Blocks:
             stage_weights = {
                 "validating": (0.05, 0.10),
                 "loading_models": (0.10, 0.15),
-                "transcribing": (0.15, 0.70),
-                "aligning": (0.70, 0.95),
+                "transcribing": (0.15, 0.55),
+                "aligning": (0.55, 0.75),
+                "refining": (0.75, 0.95),
             }
 
             def progress_callback(stage: str, value: float):
@@ -119,6 +120,7 @@ def create_app(device: str = "auto") -> gr.Blocks:
                         "loading_models": "모델 준비 중",
                         "transcribing": "자막 생성 중 (VibeVoice)",
                         "aligning": "타임스탬프 정렬 중 (Qwen)",
+                        "refining": "자막 다듬기 중 (LLM)",
                     }
                     stage_name = stage_names.get(stage, stage)
 
@@ -143,7 +145,7 @@ def create_app(device: str = "auto") -> gr.Blocks:
             # Generate SRT
             srt_content = result.to_srt(include_speaker=True)
 
-            # Save to temp file for download
+            # Save final SRT to temp file for download
             with tempfile.NamedTemporaryFile(
                 mode="w",
                 suffix=".srt",
@@ -153,6 +155,45 @@ def create_app(device: str = "auto") -> gr.Blocks:
                 f.write(srt_content)
                 srt_path = f.name
 
+            # Generate intermediate result files (use result.intermediate for thread safety)
+            from chalna.srt_utils import segments_to_srt
+
+            raw_path = None
+            aligned_path = None
+            refined_path = None
+
+            intermediate = result.intermediate
+
+            # Stage 1: Raw segments
+            raw_segs = intermediate.raw_segments if intermediate else None
+            if raw_segs:
+                raw_srt = segments_to_srt(raw_segs, include_speaker=True)
+                with tempfile.NamedTemporaryFile(
+                    mode="w", suffix="_1_raw.srt", delete=False, encoding="utf-8"
+                ) as f:
+                    f.write(raw_srt)
+                    raw_path = f.name
+
+            # Stage 2: Aligned segments
+            aligned_segs = intermediate.aligned_segments if intermediate else None
+            if aligned_segs:
+                aligned_srt = segments_to_srt(aligned_segs, include_speaker=True)
+                with tempfile.NamedTemporaryFile(
+                    mode="w", suffix="_2_aligned.srt", delete=False, encoding="utf-8"
+                ) as f:
+                    f.write(aligned_srt)
+                    aligned_path = f.name
+
+            # Stage 3: Refined segments
+            refined_segs = intermediate.refined_segments if intermediate else None
+            if refined_segs:
+                refined_srt = segments_to_srt(refined_segs, include_speaker=True)
+                with tempfile.NamedTemporaryFile(
+                    mode="w", suffix="_3_refined.srt", delete=False, encoding="utf-8"
+                ) as f:
+                    f.write(refined_srt)
+                    refined_path = f.name
+
             progress(1.0, desc=f"[{elapsed()}] 완료!")
 
             total_time = time.time() - start_time
@@ -161,14 +202,14 @@ def create_app(device: str = "auto") -> gr.Blocks:
             if result.metadata.speakers:
                 status += f" | 화자: {len(result.metadata.speakers)}명"
 
-            return srt_content, srt_path, status
+            return srt_content, srt_path, raw_path, aligned_path, refined_path, status
 
         except ChalnaError as e:
             total_time = time.time() - start_time
-            return f"오류: {e.message}", None, f"실패 (경과: {format_time(total_time)})"
+            return f"오류: {e.message}", None, None, None, None, f"실패 (경과: {format_time(total_time)})"
         except Exception as e:
             total_time = time.time() - start_time
-            return f"오류: {str(e)}", None, f"실패 (경과: {format_time(total_time)})"
+            return f"오류: {str(e)}", None, None, None, None, f"실패 (경과: {format_time(total_time)})"
 
     # Build UI
     with gr.Blocks(title="찰나 (Chalna)") as app:
@@ -206,7 +247,12 @@ def create_app(device: str = "auto") -> gr.Blocks:
                     label="SRT 출력",
                     lines=12,
                 )
-                download_output = gr.File(label="다운로드")
+                download_output = gr.File(label="최종 SRT 다운로드")
+
+                with gr.Accordion("중간 결과물", open=False):
+                    raw_download = gr.File(label="1. Raw (VibeVoice)")
+                    aligned_download = gr.File(label="2. Aligned (Qwen)")
+                    refined_download = gr.File(label="3. Refined (LLM)")
 
         # Event handlers
         audio_input.change(
@@ -218,7 +264,7 @@ def create_app(device: str = "auto") -> gr.Blocks:
         submit_btn.click(
             fn=transcribe,
             inputs=[audio_input, context_input],
-            outputs=[srt_output, download_output, status_output],
+            outputs=[srt_output, download_output, raw_download, aligned_download, refined_download, status_output],
         )
 
     return app

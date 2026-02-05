@@ -5,6 +5,8 @@ Chalna REST API Server.
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import tempfile
 import uuid
 from datetime import datetime
@@ -13,6 +15,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+
+# Results storage directory
+RESULTS_DIR = Path(os.environ.get("CHALNA_RESULTS_DIR", "/home/jonhpark/workspace/chalna/results"))
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, JSONResponse
 from pydantic import BaseModel, Field
@@ -68,6 +74,12 @@ def get_pipeline():
     if _pipeline is None:
         from chalna.pipeline import ChalnaPipeline
         _pipeline = ChalnaPipeline()
+
+        # Configure auto-unload from environment
+        auto_unload = os.environ.get("CHALNA_AUTO_UNLOAD", "true").lower() == "true"
+        keep_processor = os.environ.get("CHALNA_KEEP_PROCESSOR", "true").lower() == "true"
+        _pipeline.set_auto_unload(auto_unload, keep_processor)
+
     return _pipeline
 
 
@@ -200,6 +212,31 @@ async def health():
         models=models,
         gpu=gpu,
     )
+
+
+@app.post("/unload")
+async def unload_models(force: bool = False):
+    """
+    Manually unload models from GPU memory.
+
+    Args:
+        force: If True, also unload processor (normally kept for fast reload)
+
+    Returns:
+        Status message
+    """
+    global _pipeline
+
+    if _pipeline is None:
+        return {"status": "ok", "message": "No models loaded"}
+
+    was_loaded = _pipeline.is_loaded()
+    _pipeline.unload(force=force)
+
+    if was_loaded:
+        return {"status": "ok", "message": "Models unloaded successfully"}
+    else:
+        return {"status": "ok", "message": "No models were loaded"}
 
 
 @app.post("/transcribe")
@@ -510,14 +547,19 @@ async def _process_job(
         job.progress = 1.0
         job.completed_at = datetime.utcnow()
 
+        # Save results to files
+        _save_job_results(job, result, include_speaker)
+
     except ChalnaError as e:
         job.status = JobStatus.FAILED
         job.error = e.message
         job.error_details = e.to_dict()
+        _save_job_error(job)
 
     except Exception as e:
         job.status = JobStatus.FAILED
         job.error = str(e)
+        _save_job_error(job)
 
     finally:
         # Cleanup
@@ -528,12 +570,109 @@ async def _process_job(
 # Startup/Shutdown
 # =============================================================================
 
+def _save_job_results(job: Job, result, include_speaker: bool) -> None:
+    """Save job results to files for persistence.
+
+    Creates:
+    - {job_id}.srt - Final SRT output
+    - {job_id}.json - Full result with metadata
+    - {job_id}_raw.srt - Raw VibeVoice output (if available)
+    - {job_id}_aligned.srt - After alignment (if available)
+    - {job_id}_refined.srt - After LLM refinement (if available)
+    """
+    try:
+        job_dir = RESULTS_DIR / job.job_id[:8]  # Use first 8 chars for subdirectory
+        job_dir.mkdir(parents=True, exist_ok=True)
+
+        timestamp = job.created_at.strftime("%Y%m%d_%H%M%S")
+        base_name = f"{timestamp}_{job.job_id[:8]}"
+
+        # Save final SRT
+        srt_content = result.to_srt(include_speaker=include_speaker)
+        srt_path = job_dir / f"{base_name}.srt"
+        srt_path.write_text(srt_content, encoding="utf-8")
+
+        # Save JSON with full result
+        json_data = {
+            "job_id": job.job_id,
+            "created_at": job.created_at.isoformat(),
+            "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+            "status": job.status.value,
+            "result": result.to_dict(),
+            "progress_history": job.progress_history,
+        }
+
+        # Add intermediate results if available
+        if result.intermediate:
+            json_data["intermediate"] = {
+                "alignment_log": result.intermediate.alignment_log,
+                "refinement_log": result.intermediate.refinement_log,
+            }
+
+        json_path = job_dir / f"{base_name}.json"
+        json_path.write_text(
+            json.dumps(json_data, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+
+        # Save intermediate SRT files (generate from result.intermediate if not in job)
+        from chalna.srt_utils import segments_to_srt
+
+        if result.intermediate:
+            if result.intermediate.raw_segments:
+                raw_srt = job.raw_srt or segments_to_srt(result.intermediate.raw_segments, include_speaker=True)
+                (job_dir / f"{base_name}_1_raw.srt").write_text(raw_srt, encoding="utf-8")
+
+            if result.intermediate.aligned_segments:
+                aligned_srt = job.aligned_srt or segments_to_srt(result.intermediate.aligned_segments, include_speaker=True)
+                (job_dir / f"{base_name}_2_aligned.srt").write_text(aligned_srt, encoding="utf-8")
+
+            if result.intermediate.refined_segments:
+                refined_srt = job.refined_srt or segments_to_srt(result.intermediate.refined_segments, include_speaker=True)
+                (job_dir / f"{base_name}_3_refined.srt").write_text(refined_srt, encoding="utf-8")
+
+        print(f"Results saved to: {job_dir}")
+
+    except Exception as e:
+        print(f"Failed to save job results: {e}")
+
+
+def _save_job_error(job: Job) -> None:
+    """Save job error information for debugging."""
+    try:
+        job_dir = RESULTS_DIR / job.job_id[:8]
+        job_dir.mkdir(parents=True, exist_ok=True)
+
+        timestamp = job.created_at.strftime("%Y%m%d_%H%M%S")
+        base_name = f"{timestamp}_{job.job_id[:8]}"
+
+        error_data = {
+            "job_id": job.job_id,
+            "created_at": job.created_at.isoformat(),
+            "status": job.status.value,
+            "error": job.error,
+            "error_details": job.error_details,
+            "progress_history": job.progress_history,
+        }
+
+        error_path = job_dir / f"{base_name}_error.json"
+        error_path.write_text(
+            json.dumps(error_data, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+
+        print(f"Error saved to: {error_path}")
+
+    except Exception as e:
+        print(f"Failed to save job error: {e}")
+
+
 @app.on_event("startup")
 async def startup():
     """Preload models on startup."""
     # Optionally preload models here
     # get_pipeline()
-    pass
+    print(f"Results will be saved to: {RESULTS_DIR}")
 
 
 @app.on_event("shutdown")

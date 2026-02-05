@@ -70,6 +70,10 @@ class ChalnaPipeline:
         self._vibevoice_processor = None
         self._aligner = None
 
+        # Auto-unload settings
+        self._auto_unload = True  # Unload models after each request
+        self._keep_processor = True  # Keep processor (small, fast to reload)
+
         # Results storage - intermediate stages
         self._last_alignment_log = []
         self._pre_alignment_segments = None  # Alias for _raw_segments
@@ -98,6 +102,46 @@ class ChalnaPipeline:
         if self.device == "cuda":
             return torch.bfloat16
         return torch.float32
+
+    def unload(self, force: bool = False) -> None:
+        """Unload models from GPU memory.
+
+        Args:
+            force: If True, also unload processor (normally kept for fast reload)
+        """
+        if self._vibevoice_model is not None:
+            del self._vibevoice_model
+            self._vibevoice_model = None
+            print("VibeVoice model unloaded.")
+
+        if self._aligner is not None:
+            del self._aligner
+            self._aligner = None
+            print("Qwen aligner unloaded.")
+
+        if force and self._vibevoice_processor is not None:
+            del self._vibevoice_processor
+            self._vibevoice_processor = None
+            print("VibeVoice processor unloaded.")
+
+        # Clear CUDA cache
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+
+    def is_loaded(self) -> bool:
+        """Check if models are currently loaded."""
+        return self._vibevoice_model is not None or self._aligner is not None
+
+    def set_auto_unload(self, enabled: bool, keep_processor: bool = True) -> None:
+        """Configure auto-unload behavior.
+
+        Args:
+            enabled: Whether to unload models after each request
+            keep_processor: Whether to keep processor loaded (faster reload)
+        """
+        self._auto_unload = enabled
+        self._keep_processor = keep_processor
 
     def _load_vibevoice(self):
         """Load VibeVoice model and processor.
@@ -369,6 +413,10 @@ class ChalnaPipeline:
             alignment_log=self._last_alignment_log,
             refinement_log=self._refinement_log,
         )
+
+        # Auto-unload models to free GPU memory
+        if self._auto_unload:
+            self.unload(force=not self._keep_processor)
 
         return TranscriptionResult(
             segments=segments,

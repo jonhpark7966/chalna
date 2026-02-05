@@ -1,0 +1,15 @@
+[Unit]
+Description=Chalna REST API (FastAPI)
+After=network.target
+
+[Service]
+Type=simple
+User=jonhpark
+WorkingDirectory=/home/jonhpark/workspace/chalna
+Environment="PATH=/home/jonhpark/workspace/chalna/venv/bin"
+ExecStart=/home/jonhpark/workspace/chalna/venv/bin/uvicorn chalna.server:app --host 0.0.0.0 --port 7861
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

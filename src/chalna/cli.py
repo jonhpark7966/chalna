@@ -27,6 +27,7 @@ from chalna.exceptions import (
     OutOfMemoryError,
     TempFileError,
     UnsupportedFormatError,
+    VibevoiceAPIError,
 )
 
 app = typer.Typer(
@@ -360,6 +361,15 @@ def transcribe(
         console.print("  - Check your internet connection")
         console.print("  - Try again later")
         console.print("  - Set HF_HUB_OFFLINE=1 to use cached models")
+        raise typer.Exit(code=1)
+
+    except VibevoiceAPIError as e:
+        console.print(f"[bold red]Error:[/bold red] VibeVoice API error")
+        console.print(f"  {e.message}")
+        console.print()
+        console.print("[dim]Suggestions:[/dim]")
+        console.print("  - Check that the VibeVoice API server is running")
+        console.print("  - Set VIBEVOICE_API_URL environment variable if using a different address")
         raise typer.Exit(code=1)
 
     except CodexAPIError as e:

@@ -1,7 +1,7 @@
 """
 Chalna (찰나) - SRT subtitle generation service.
 
-VibeVoice ASR + Qwen Forced Alignment for accurate timestamps and speaker diarization.
+VibeVoice API + Qwen Forced Alignment for accurate timestamps and speaker diarization.
 """
 
 __version__ = "0.1.0"
@@ -21,6 +21,7 @@ from chalna.exceptions import (
     OutOfMemoryError,
     TempFileError,
     UnsupportedFormatError,
+    VibevoiceAPIError,
 )
 from chalna.models import Segment, TranscriptionResult
 from chalna.pipeline import ChalnaPipeline
@@ -43,6 +44,7 @@ __all__ = [
     "EmptyTranscriptionError",
     "ModelLoadError",
     "ModelDownloadError",
+    "VibevoiceAPIError",
     "DiskSpaceError",
     "TempFileError",
     "FFmpegNotFoundError",

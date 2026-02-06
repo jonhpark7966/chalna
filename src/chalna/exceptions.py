@@ -29,6 +29,7 @@ class ErrorCode(str, Enum):
     MODEL_DOWNLOAD_FAILED = "E3001"
     CODEX_API_ERROR = "E3002"
     CODEX_RATE_LIMIT = "E3003"
+    VIBEVOICE_API_ERROR = "E3004"
 
     # System (4xxx)
     DISK_SPACE_ERROR = "E4001"
@@ -310,6 +311,23 @@ class CodexRateLimitError(ChalnaError):
             "reason": message,
         }
         super().__init__(full_message, details)
+
+
+class VibevoiceAPIError(ChalnaError):
+    """Raised when VibeVoice API call fails (connection error, bad response, etc.)."""
+
+    error_code = ErrorCode.VIBEVOICE_API_ERROR
+    http_status = 503
+
+    def __init__(
+        self,
+        message: str,
+        cause: Optional[Exception] = None,
+    ):
+        details = {
+            "reason": message,
+        }
+        super().__init__(message, details, cause)
 
 
 # =============================================================================

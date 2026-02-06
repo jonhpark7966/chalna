@@ -1,11 +1,9 @@
 """
-Chalna Pipeline - VibeVoice ASR + Qwen Forced Alignment.
+Chalna Pipeline - VibeVoice API + Qwen Forced Alignment.
 """
 
 from __future__ import annotations
 
-import json
-import sys
 import tempfile
 from pathlib import Path
 from typing import Callable, List, Optional
@@ -16,12 +14,12 @@ from chalna.exceptions import (
     CodexAPIError,
     CodexRateLimitError,
     EmptyTranscriptionError,
-    ModelDownloadError,
-    ModelLoadError,
     OutOfMemoryError,
     TempFileError,
+    VibevoiceAPIError,
 )
 from chalna.models import IntermediateResults, Segment, TranscriptionMetadata, TranscriptionResult
+from chalna.settings import settings
 from chalna.validation import (
     check_disk_space,
     estimate_temp_space_required,
@@ -44,35 +42,29 @@ class ChalnaPipeline:
         dtype: Optional[torch.dtype] = None,
         use_alignment: bool = True,
         use_llm_refinement: bool = True,
-        vibevoice_path: str = "microsoft/VibeVoice-ASR",
         aligner_path: str = "Qwen/Qwen3-ForcedAligner-0.6B",
     ):
         """
         Initialize the pipeline.
 
         Args:
-            device: Device to use (cuda, cpu, mps, xpu, auto)
-            dtype: Data type for models (None for auto)
+            device: Device to use for aligner (cuda, cpu, mps, xpu, auto)
+            dtype: Data type for aligner model (None for auto)
             use_alignment: Whether to use Qwen forced alignment
             use_llm_refinement: Whether to use LLM-based subtitle refinement (requires Codex CLI)
-            vibevoice_path: Path or HuggingFace ID for VibeVoice model
             aligner_path: Path or HuggingFace ID for Qwen aligner model
         """
         self.device = self._resolve_device(device)
         self.dtype = dtype or self._resolve_dtype()
         self.use_alignment = use_alignment
         self.use_llm_refinement = use_llm_refinement
-        self.vibevoice_path = vibevoice_path
         self.aligner_path = aligner_path
 
-        # Lazy loading
-        self._vibevoice_model = None
-        self._vibevoice_processor = None
+        # Lazy loading (aligner only)
         self._aligner = None
 
         # Auto-unload settings
-        self._auto_unload = True  # Unload models after each request
-        self._keep_processor = True  # Keep processor (small, fast to reload)
+        self._auto_unload = False  # Keep aligner loaded for fast subsequent requests
 
         # Results storage - intermediate stages
         self._last_alignment_log = []
@@ -104,25 +96,15 @@ class ChalnaPipeline:
         return torch.float32
 
     def unload(self, force: bool = False) -> None:
-        """Unload models from GPU memory.
+        """Unload aligner model from GPU memory.
 
         Args:
-            force: If True, also unload processor (normally kept for fast reload)
+            force: If True, force full cleanup (kept for API compatibility)
         """
-        if self._vibevoice_model is not None:
-            del self._vibevoice_model
-            self._vibevoice_model = None
-            print("VibeVoice model unloaded.")
-
         if self._aligner is not None:
             del self._aligner
             self._aligner = None
             print("Qwen aligner unloaded.")
-
-        if force and self._vibevoice_processor is not None:
-            del self._vibevoice_processor
-            self._vibevoice_processor = None
-            print("VibeVoice processor unloaded.")
 
         # Clear CUDA cache
         if torch.cuda.is_available():
@@ -130,98 +112,103 @@ class ChalnaPipeline:
             torch.cuda.synchronize()
 
     def is_loaded(self) -> bool:
-        """Check if models are currently loaded."""
-        return self._vibevoice_model is not None or self._aligner is not None
+        """Check if aligner model is currently loaded."""
+        return self._aligner is not None
 
     def set_auto_unload(self, enabled: bool, keep_processor: bool = True) -> None:
         """Configure auto-unload behavior.
 
         Args:
-            enabled: Whether to unload models after each request
-            keep_processor: Whether to keep processor loaded (faster reload)
+            enabled: Whether to unload aligner after each request
+            keep_processor: Ignored (kept for API compatibility)
         """
         self._auto_unload = enabled
-        self._keep_processor = keep_processor
 
-    def _load_vibevoice(self):
-        """Load VibeVoice model and processor.
+    def _call_vibevoice_api(
+        self,
+        audio_path: Path,
+        context: Optional[str] = None,
+        max_new_tokens: int = 65536,
+    ) -> List[Segment]:
+        """Call VibeVoice API to transcribe audio.
+
+        Args:
+            audio_path: Path to audio file
+            context: Optional context/hotwords
+            max_new_tokens: Maximum tokens for generation
+
+        Returns:
+            List of Segment objects from API response
 
         Raises:
-            OutOfMemoryError: If GPU/CPU memory is exhausted.
-            ModelLoadError: If model loading fails.
-            ModelDownloadError: If model download fails.
+            VibevoiceAPIError: If API call fails
         """
-        if self._vibevoice_model is not None:
-            return
+        import httpx
 
-        # Add external/VibeVoice to path
-        vibevoice_path = Path(__file__).parent.parent.parent / "external" / "VibeVoice"
-        if vibevoice_path.exists():
-            sys.path.insert(0, str(vibevoice_path))
+        url = f"{settings.vibevoice_api_url}/transcribe"
 
         try:
-            from vibevoice.modular.modeling_vibevoice_asr import VibeVoiceASRForConditionalGeneration
-            from vibevoice.processor.vibevoice_asr_processor import VibeVoiceASRProcessor
-        except ImportError as e:
-            raise ModelLoadError(
-                model_name="VibeVoice",
-                reason="VibeVoice module not found",
+            with open(audio_path, "rb") as f:
+                files = {"file": (audio_path.name, f, "application/octet-stream")}
+                data = {}
+                if context:
+                    data["context"] = context
+                if max_new_tokens != 65536:
+                    data["max_new_tokens"] = str(max_new_tokens)
+
+                with httpx.Client(timeout=600.0) as client:
+                    response = client.post(url, files=files, data=data)
+
+        except httpx.ConnectError as e:
+            raise VibevoiceAPIError(
+                f"Cannot connect to VibeVoice API at {settings.vibevoice_api_url}. "
+                f"Is the server running?",
                 cause=e,
             )
-
-        print(f"Loading VibeVoice model from {self.vibevoice_path}...")
-
-        # Try attention implementations in order: sdpa > eager
-        last_error = None
-        for attn_impl in ["sdpa", "eager"]:
-            try:
-                self._vibevoice_model = VibeVoiceASRForConditionalGeneration.from_pretrained(
-                    self.vibevoice_path,
-                    dtype=self.dtype,
-                    device_map=self.device,
-                    attn_implementation=attn_impl,
-                    trust_remote_code=True,
-                )
-                print(f"Using attention implementation: {attn_impl}")
-                break
-            except torch.cuda.OutOfMemoryError as e:
-                raise OutOfMemoryError(memory_type="GPU", cause=e)
-            except MemoryError as e:
-                raise OutOfMemoryError(memory_type="CPU", cause=e)
-            except OSError as e:
-                # Often indicates download failure
-                if "Connection" in str(e) or "HTTP" in str(e):
-                    raise ModelDownloadError(model_name=self.vibevoice_path, cause=e)
-                last_error = e
-                if attn_impl == "eager":
-                    raise ModelLoadError(
-                        model_name=self.vibevoice_path,
-                        reason=str(e),
-                        cause=e,
-                    )
-            except Exception as e:
-                print(f"Failed to load with {attn_impl}: {e}")
-                last_error = e
-                if attn_impl == "eager":
-                    raise ModelLoadError(
-                        model_name=self.vibevoice_path,
-                        reason=str(e),
-                        cause=e,
-                    )
-
-        try:
-            self._vibevoice_processor = VibeVoiceASRProcessor.from_pretrained(
-                self.vibevoice_path,
-                language_model_pretrained_name="Qwen/Qwen2.5-7B",
+        except httpx.TimeoutException as e:
+            raise VibevoiceAPIError(
+                f"VibeVoice API request timed out ({settings.vibevoice_api_url})",
+                cause=e,
             )
         except Exception as e:
-            raise ModelLoadError(
-                model_name="VibeVoiceASRProcessor",
-                reason=str(e),
+            raise VibevoiceAPIError(
+                f"VibeVoice API request failed: {e}",
                 cause=e,
             )
 
-        print("VibeVoice model loaded.")
+        if response.status_code != 200:
+            raise VibevoiceAPIError(
+                f"VibeVoice API returned HTTP {response.status_code}: {response.text}"
+            )
+
+        try:
+            result = response.json()
+        except Exception as e:
+            raise VibevoiceAPIError(
+                f"Failed to parse VibeVoice API response as JSON",
+                cause=e,
+            )
+
+        api_segments = result.get("segments", [])
+        segments = []
+        for i, item in enumerate(api_segments, start=1):
+            text = item.get("text", "")
+            # Skip environmental sounds and silence markers
+            if text.startswith("[") and text.endswith("]"):
+                continue
+            segments.append(Segment(
+                index=i,
+                start_time=float(item.get("start_time", 0)),
+                end_time=float(item.get("end_time", 0)),
+                text=text,
+                speaker_id=item.get("speaker_id"),
+            ))
+
+        # Re-index after filtering
+        for i, seg in enumerate(segments, start=1):
+            seg.index = i
+
+        return segments
 
     def _load_aligner(self):
         """Load Qwen forced aligner.
@@ -263,7 +250,7 @@ class ChalnaPipeline:
         audio_path: str | Path,
         context: Optional[str] = None,
         language: Optional[str] = None,
-        max_new_tokens: int = 32768,
+        max_new_tokens: int = 65536,
         verbose: bool = True,
         progress_callback: Optional[Callable[[str, float], None]] = None,
     ) -> TranscriptionResult:
@@ -305,21 +292,14 @@ class ChalnaPipeline:
         required_mb = estimate_temp_space_required(audio_info)
         check_disk_space(required_mb)
 
-        # Load models
+        # Load aligner model
         _progress("loading_models", 0.0)
-        self._load_vibevoice()
-        _progress("loading_models", 0.5)
         self._load_aligner()
         _progress("loading_models", 1.0)
 
-        # Step 1: VibeVoice ASR
+        # Step 1: VibeVoice ASR (via API)
         _progress("transcribing", 0.0)
-        try:
-            segments = self._run_vibevoice(audio_path, context, max_new_tokens)
-        except torch.cuda.OutOfMemoryError as e:
-            raise OutOfMemoryError(memory_type="GPU", cause=e)
-        except MemoryError as e:
-            raise OutOfMemoryError(memory_type="CPU", cause=e)
+        segments = self._call_vibevoice_api(audio_path, context, max_new_tokens)
         _progress("transcribing", 1.0)
 
         # Check for empty transcription
@@ -414,9 +394,9 @@ class ChalnaPipeline:
             refinement_log=self._refinement_log,
         )
 
-        # Auto-unload models to free GPU memory
+        # Auto-unload aligner to free GPU memory
         if self._auto_unload:
-            self.unload(force=not self._keep_processor)
+            self.unload()
 
         return TranscriptionResult(
             segments=segments,
@@ -482,118 +462,6 @@ class ChalnaPipeline:
             print("  " + "-" * 80)
 
         return self._run_alignment(audio_path, segments, verbose=verbose)
-
-    def _run_vibevoice(
-        self,
-        audio_path: Path,
-        context: Optional[str],
-        max_new_tokens: int,
-    ) -> List[Segment]:
-        """Run VibeVoice ASR."""
-        # Prepare input
-        inputs = self._vibevoice_processor(
-            str(audio_path),
-            context_info=context,
-            return_tensors="pt",
-        )
-
-        # Move to device
-        inputs = {
-            k: v.to(self.device) if hasattr(v, "to") else v
-            for k, v in inputs.items()
-        }
-
-        # Generate
-        with torch.no_grad():
-            outputs = self._vibevoice_model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                temperature=0.0,
-                do_sample=False,
-            )
-
-        # Decode
-        raw_output = self._vibevoice_processor.batch_decode(
-            outputs,
-            skip_special_tokens=True,
-        )[0]
-
-        # Parse output - try multiple methods
-        parsed = self._parse_transcription(raw_output)
-
-        # Convert to Segment objects
-        segments = []
-        for i, item in enumerate(parsed, start=1):
-            # Handle different key naming conventions
-            start_time = item.get("start_time") or item.get("Start time") or item.get("Start") or 0
-            end_time = item.get("end_time") or item.get("End time") or item.get("End") or 0
-            text = item.get("text") or item.get("Content") or ""
-
-            # Handle speaker ID - check for various key names and handle 0 as valid
-            speaker = None
-            for key in ["speaker_id", "Speaker ID", "Speaker"]:
-                if key in item and item[key] is not None:
-                    speaker = item[key]
-                    break
-
-            # Skip environmental sounds and silence markers
-            if text.startswith("[") and text.endswith("]"):
-                continue
-
-            segments.append(Segment(
-                index=i,
-                start_time=float(start_time),
-                end_time=float(end_time),
-                text=text,
-                speaker_id=f"Speaker {speaker}" if speaker is not None else None,
-            ))
-
-        # Re-index after filtering
-        for i, seg in enumerate(segments, start=1):
-            seg.index = i
-
-        return segments
-
-    def _parse_transcription(self, raw_output: str) -> List[dict]:
-        """Parse transcription output from VibeVoice."""
-        import re
-
-        # Try processor's post_process first
-        try:
-            parsed = self._vibevoice_processor.post_process_transcription(raw_output)
-            if parsed:
-                return parsed
-        except Exception as e:
-            print(f"post_process_transcription failed: {e}")
-
-        # Manual parsing - find JSON array in output
-        # Look for content after "assistant" tag
-        if "assistant" in raw_output:
-            raw_output = raw_output.split("assistant")[-1].strip()
-
-        # Try to find JSON array
-        json_match = re.search(r'\[.*\]', raw_output, re.DOTALL)
-        if json_match:
-            try:
-                return json.loads(json_match.group())
-            except json.JSONDecodeError as e:
-                print(f"JSON parse error: {e}")
-
-        # Try parsing as JSONL (one object per line)
-        results = []
-        for line in raw_output.split('\n'):
-            line = line.strip()
-            if line.startswith('{') and line.endswith('}'):
-                try:
-                    results.append(json.loads(line))
-                except json.JSONDecodeError:
-                    pass
-
-        if results:
-            return results
-
-        print(f"Failed to parse transcription output. Raw length: {len(raw_output)}")
-        return []
 
     def _run_llm_refinement(
         self,

@@ -76,9 +76,8 @@ def get_pipeline():
         _pipeline = ChalnaPipeline()
 
         # Configure auto-unload from environment
-        auto_unload = os.environ.get("CHALNA_AUTO_UNLOAD", "true").lower() == "true"
-        keep_processor = os.environ.get("CHALNA_KEEP_PROCESSOR", "true").lower() == "true"
-        _pipeline.set_auto_unload(auto_unload, keep_processor)
+        auto_unload = os.environ.get("CHALNA_AUTO_UNLOAD", "false").lower() == "true"
+        _pipeline.set_auto_unload(auto_unload)
 
     return _pipeline
 
@@ -188,21 +187,32 @@ async def health():
     """
     Check server health and model status.
     """
-    import torch
+    from chalna.settings import settings
 
     gpu = None
-    if torch.cuda.is_available():
-        gpu = torch.cuda.get_device_name(0)
+    try:
+        import torch
+        if torch.cuda.is_available():
+            gpu = torch.cuda.get_device_name(0)
+    except ImportError:
+        pass
 
-    # Check model status
+    # Check model/API status
     models = {
-        "vibevoice": "not_loaded",
+        "vibevoice_api": "unknown",
         "qwen_aligner": "not_loaded",
     }
 
+    # Check VibeVoice API connectivity
+    try:
+        import httpx
+        with httpx.Client(timeout=5.0) as client:
+            resp = client.get(f"{settings.vibevoice_api_url}/health")
+            models["vibevoice_api"] = "available" if resp.status_code == 200 else "error"
+    except Exception:
+        models["vibevoice_api"] = "unavailable"
+
     if _pipeline is not None:
-        if _pipeline._vibevoice_model is not None:
-            models["vibevoice"] = "loaded"
         if _pipeline._aligner is not None:
             models["qwen_aligner"] = "loaded"
 

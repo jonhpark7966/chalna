@@ -203,12 +203,15 @@ async def health():
         "qwen_aligner": "not_loaded",
     }
 
-    # Check VibeVoice API connectivity
+    # Check VibeVoice vLLM API connectivity
     try:
         import httpx
         with httpx.Client(timeout=5.0) as client:
-            resp = client.get(f"{settings.vibevoice_api_url}/health")
-            models["vibevoice_api"] = "available" if resp.status_code == 200 else "error"
+            resp = client.get(f"{settings.vibevoice_api_url}/v1/models")
+            if resp.status_code == 200:
+                models["vibevoice_api"] = "available"
+            else:
+                models["vibevoice_api"] = "error"
     except Exception:
         models["vibevoice_api"] = "unavailable"
 

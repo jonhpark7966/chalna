@@ -524,6 +524,132 @@ def web(
     launch(host=host, port=port, share=share, device=device)
 
 
+@app.command(name="serve-vibevoice")
+def serve_vibevoice(
+    port: int = typer.Option(
+        8001,
+        "--port", "-p",
+        help="Port to bind to",
+    ),
+    model: str = typer.Option(
+        "microsoft/VibeVoice-ASR",
+        "--model",
+        help="HuggingFace model ID or local path",
+    ),
+    gpu_memory_utilization: float = typer.Option(
+        0.8,
+        "--gpu-memory-utilization",
+        help="Fraction of GPU memory to use (0.0-1.0)",
+    ),
+    max_model_len: int = typer.Option(
+        65536,
+        "--max-model-len",
+        help="Maximum model context length in tokens",
+    ),
+    tensor_parallel_size: int = typer.Option(
+        1,
+        "--tensor-parallel-size",
+        help="Number of GPUs for tensor parallelism",
+    ),
+):
+    """
+    Start the VibeVoice ASR server using vLLM.
+
+    Downloads the model if needed, generates tokenizer files, and launches
+    vLLM with optimized settings for VibeVoice ASR.
+
+    Examples:
+
+        chalna serve-vibevoice
+
+        chalna serve-vibevoice --port 8002 --gpu-memory-utilization 0.9
+    """
+    import os
+    import shutil
+    import subprocess
+    import sys
+
+    console.print(f"[bold blue]Chalna (찰나)[/bold blue] - VibeVoice ASR Server (vLLM)")
+    console.print()
+
+    # Check vllm is installed
+    if not shutil.which("vllm"):
+        console.print("[bold red]Error:[/bold red] vllm command not found")
+        console.print()
+        console.print("[dim]Install vLLM:[/dim]")
+        console.print("  pip install vllm")
+        raise typer.Exit(code=1)
+
+    # Resolve model path from HuggingFace cache
+    console.print(f"  Model: {model}")
+    try:
+        from huggingface_hub import snapshot_download
+
+        model_path = snapshot_download(model)
+        console.print(f"  Model path: {model_path}")
+    except ImportError:
+        console.print("[bold red]Error:[/bold red] huggingface_hub not installed")
+        console.print("  pip install huggingface_hub")
+        raise typer.Exit(code=1)
+    except Exception as e:
+        console.print(f"[bold red]Error:[/bold red] Failed to download/locate model: {e}")
+        raise typer.Exit(code=1)
+
+    # Check/generate tokenizer files (required by vLLM)
+    tokenizer_json = Path(model_path) / "tokenizer.json"
+    if not tokenizer_json.exists():
+        console.print("  Generating tokenizer files...")
+        try:
+            subprocess.run(
+                [
+                    sys.executable, "-m",
+                    "vllm_plugin.tools.generate_tokenizer_files",
+                    "--output", model_path,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            console.print("  Tokenizer files generated.")
+        except subprocess.CalledProcessError as e:
+            console.print(f"[bold red]Error:[/bold red] Failed to generate tokenizer files")
+            if e.stderr:
+                console.print(f"  {e.stderr.strip()}")
+            raise typer.Exit(code=1)
+        except FileNotFoundError:
+            console.print("[bold red]Error:[/bold red] vllm_plugin not found")
+            console.print("  Install VibeVoice: cd external/VibeVoice && pip install -e .")
+            raise typer.Exit(code=1)
+
+    console.print(f"  Port: {port}")
+    console.print(f"  GPU memory: {gpu_memory_utilization:.0%}")
+    console.print(f"  Max model len: {max_model_len}")
+    console.print()
+    console.print("[bold green]Starting vLLM server...[/bold green]")
+    console.print()
+
+    # Build vLLM command
+    vllm_args = [
+        "vllm", "serve", model_path,
+        "--served-model-name", "vibevoice",
+        "--trust-remote-code",
+        "--dtype", "bfloat16",
+        "--max-num-seqs", "64",
+        "--max-model-len", str(max_model_len),
+        "--max-num-batched-tokens", "32768",
+        "--gpu-memory-utilization", str(gpu_memory_utilization),
+        "--enforce-eager",
+        "--no-enable-prefix-caching",
+        "--enable-chunked-prefill",
+        "--chat-template-content-format", "openai",
+        "--tensor-parallel-size", str(tensor_parallel_size),
+        "--port", str(port),
+    ]
+
+    # Replace current process with vLLM server
+    os.execvp("vllm", vllm_args)
+
+
 @app.command()
 def version():
     """Show version information."""

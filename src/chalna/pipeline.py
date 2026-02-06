@@ -124,16 +124,41 @@ class ChalnaPipeline:
         """
         self._auto_unload = enabled
 
+    @staticmethod
+    def _guess_mime_type(path: Path) -> str:
+        """Guess MIME type from file extension."""
+        ext = path.suffix.lower()
+        mime_map = {
+            ".wav": "audio/wav",
+            ".mp3": "audio/mpeg",
+            ".m4a": "audio/mp4",
+            ".mp4": "video/mp4",
+            ".m4v": "video/mp4",
+            ".mov": "video/mp4",
+            ".webm": "video/webm",
+            ".flac": "audio/flac",
+            ".ogg": "audio/ogg",
+            ".opus": "audio/ogg",
+            ".aac": "audio/aac",
+            ".wma": "audio/x-ms-wma",
+        }
+        return mime_map.get(ext, "application/octet-stream")
+
     def _call_vibevoice_api(
         self,
         audio_path: Path,
+        duration: float,
         context: Optional[str] = None,
         max_new_tokens: int = 65536,
     ) -> List[Segment]:
-        """Call VibeVoice API to transcribe audio.
+        """Call VibeVoice vLLM API to transcribe audio.
+
+        Uses the OpenAI-compatible /v1/chat/completions endpoint with
+        base64-encoded audio.
 
         Args:
             audio_path: Path to audio file
+            duration: Audio duration in seconds
             context: Optional context/hotwords
             max_new_tokens: Maximum tokens for generation
 
@@ -143,65 +168,214 @@ class ChalnaPipeline:
         Raises:
             VibevoiceAPIError: If API call fails
         """
+        import base64
+        import json
+
         import httpx
 
-        url = f"{settings.vibevoice_api_url}/transcribe"
+        url = f"{settings.vibevoice_api_url}/v1/chat/completions"
 
+        # Encode audio as base64 data URL
         try:
-            with open(audio_path, "rb") as f:
-                files = {"file": (audio_path.name, f, "application/octet-stream")}
-                data = {}
-                if context:
-                    data["context"] = context
-                if max_new_tokens != 65536:
-                    data["max_new_tokens"] = str(max_new_tokens)
+            audio_bytes = audio_path.read_bytes()
+            audio_b64 = base64.b64encode(audio_bytes).decode("ascii")
+        except Exception as e:
+            raise VibevoiceAPIError(f"Failed to read audio file: {e}", cause=e)
 
+        mime = self._guess_mime_type(audio_path)
+        data_url = f"data:{mime};base64,{audio_b64}"
+
+        # Build prompt with sentence segmentation instruction
+        sentence_instruction = """
+IMPORTANT SEGMENTATION RULES:
+- Create a NEW segment for EACH complete sentence
+- Split at sentence boundaries: . ? ! 。？！
+- Each segment should contain exactly ONE sentence
+- Maintain Speaker ID for tracking who said what
+- Provide accurate Start time and End time for each sentence
+"""
+
+        show_keys = ["Start time", "End time", "Speaker ID", "Content"]
+        if context and context.strip():
+            prompt_text = (
+                f"This is a {duration:.2f} seconds audio, "
+                f"with extra info: {context.strip()}\n\n"
+                f"{sentence_instruction}\n\n"
+                f"Please transcribe it with these keys: " + ", ".join(show_keys)
+            )
+        else:
+            prompt_text = (
+                f"This is a {duration:.2f} seconds audio.\n\n"
+                f"{sentence_instruction}\n\n"
+                f"Please transcribe it with these keys: " + ", ".join(show_keys)
+            )
+
+        system_content = "You are a helpful assistant that transcribes audio input into text output in JSON format."
+
+        messages = [
+            {
+                "role": "system",
+                "content": system_content,
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "audio_url", "audio_url": {"url": data_url}},
+                    {"type": "text", "text": prompt_text},
+                ],
+            },
+        ]
+
+        all_segments: List[Segment] = []
+        max_continuations = 10  # Safety limit to prevent infinite loops
+
+        for attempt in range(max_continuations + 1):
+            payload = {
+                "model": settings.vibevoice_model_name,
+                "messages": messages,
+                "max_tokens": max_new_tokens,
+                "temperature": 0.0,
+                "stream": False,
+                "top_p": 1.0,
+                "repetition_penalty": 1.0,
+            }
+
+            try:
                 with httpx.Client(timeout=600.0) as client:
-                    response = client.post(url, files=files, data=data)
+                    response = client.post(url, json=payload)
+            except httpx.ConnectError as e:
+                raise VibevoiceAPIError(
+                    f"Cannot connect to VibeVoice vLLM API at {settings.vibevoice_api_url}. "
+                    f"Is the server running? (start with: chalna serve-vibevoice)",
+                    cause=e,
+                )
+            except httpx.TimeoutException as e:
+                raise VibevoiceAPIError(
+                    f"VibeVoice API request timed out ({settings.vibevoice_api_url})",
+                    cause=e,
+                )
+            except Exception as e:
+                raise VibevoiceAPIError(
+                    f"VibeVoice API request failed: {e}",
+                    cause=e,
+                )
 
-        except httpx.ConnectError as e:
-            raise VibevoiceAPIError(
-                f"Cannot connect to VibeVoice API at {settings.vibevoice_api_url}. "
-                f"Is the server running?",
-                cause=e,
-            )
-        except httpx.TimeoutException as e:
-            raise VibevoiceAPIError(
-                f"VibeVoice API request timed out ({settings.vibevoice_api_url})",
-                cause=e,
-            )
-        except Exception as e:
-            raise VibevoiceAPIError(
-                f"VibeVoice API request failed: {e}",
-                cause=e,
+            if response.status_code != 200:
+                raise VibevoiceAPIError(
+                    f"VibeVoice API returned HTTP {response.status_code}: {response.text}"
+                )
+
+            # Parse OpenAI-compatible response
+            try:
+                result = response.json()
+                content = result["choices"][0]["message"]["content"]
+                finish_reason = result["choices"][0].get("finish_reason", "stop")
+            except (KeyError, IndexError) as e:
+                raise VibevoiceAPIError(
+                    f"Unexpected vLLM response structure: {e}",
+                    cause=e,
+                )
+            except Exception as e:
+                raise VibevoiceAPIError(
+                    f"Failed to parse VibeVoice API response: {e}",
+                    cause=e,
+                )
+
+            # Parse segments from this response
+            segments = self._parse_vibevoice_response(content)
+            all_segments.extend(segments)
+
+            # If response completed normally, we're done
+            if finish_reason != "length":
+                break
+
+            # Response was truncated — request continuation
+            if not segments:
+                # Truncated but couldn't parse any segments, stop
+                break
+
+            last_seg = segments[-1]
+            print(
+                f"  Response truncated at {last_seg.end_time:.2f}s "
+                f"({len(all_segments)} segments so far), requesting continuation..."
             )
 
-        if response.status_code != 200:
-            raise VibevoiceAPIError(
-                f"VibeVoice API returned HTTP {response.status_code}: {response.text}"
+            # Build continuation prompt: ask to continue from where it stopped
+            continuation_text = (
+                f"The previous transcription was cut off at {last_seg.end_time:.2f}s. "
+                f"Please continue transcribing from {last_seg.end_time:.2f}s to the end "
+                f"of the audio. Output ONLY the remaining segments as a JSON array "
+                f"with the same keys: " + ", ".join(show_keys)
             )
 
+            # Append assistant's truncated response and user's continuation request
+            messages.append({"role": "assistant", "content": content})
+            messages.append({"role": "user", "content": continuation_text})
+
+        # Re-index all collected segments
+        for i, seg in enumerate(all_segments, start=1):
+            seg.index = i
+
+        return all_segments
+
+    def _parse_vibevoice_response(self, content: str) -> List[Segment]:
+        """Parse VibeVoice vLLM response content into Segment objects.
+
+        The response is a JSON array of objects with keys:
+        "Start time", "End time", "Speaker ID", "Content".
+
+        Handles truncated JSON (when max_tokens is exceeded) by attempting
+        to recover partial results.
+
+        Args:
+            content: Raw text from vLLM response
+
+        Returns:
+            List of Segment objects
+
+        Raises:
+            VibevoiceAPIError: If parsing completely fails
+        """
+        import json
+
+        content = content.strip()
+
+        # Try direct JSON parse first
+        api_segments = None
         try:
-            result = response.json()
-        except Exception as e:
+            parsed = json.loads(content)
+            if isinstance(parsed, list):
+                api_segments = parsed
+            elif isinstance(parsed, dict) and "segments" in parsed:
+                api_segments = parsed["segments"]
+            elif isinstance(parsed, dict):
+                # Single segment wrapped in dict
+                api_segments = [parsed]
+        except json.JSONDecodeError:
+            pass
+
+        # Try to recover truncated JSON
+        if api_segments is None:
+            api_segments = self._recover_truncated_json(content)
+
+        if api_segments is None:
             raise VibevoiceAPIError(
-                f"Failed to parse VibeVoice API response as JSON",
-                cause=e,
+                f"Failed to parse VibeVoice response as JSON. Content starts with: {content[:200]}"
             )
 
-        api_segments = result.get("segments", [])
+        # Convert to Segment objects
         segments = []
         for i, item in enumerate(api_segments, start=1):
-            text = item.get("text", "")
+            text = item.get("Content", "")
             # Skip environmental sounds and silence markers
             if text.startswith("[") and text.endswith("]"):
                 continue
             segments.append(Segment(
                 index=i,
-                start_time=float(item.get("start_time", 0)),
-                end_time=float(item.get("end_time", 0)),
+                start_time=float(item.get("Start time", 0)),
+                end_time=float(item.get("End time", 0)),
                 text=text,
-                speaker_id=item.get("speaker_id"),
+                speaker_id=item.get("Speaker ID"),
             ))
 
         # Re-index after filtering
@@ -209,6 +383,60 @@ class ChalnaPipeline:
             seg.index = i
 
         return segments
+
+    @staticmethod
+    def _recover_truncated_json(content: str) -> Optional[list]:
+        """Attempt to recover segments from truncated JSON output.
+
+        When max_tokens is exceeded, the JSON may be cut off mid-array.
+        This tries to find complete objects within the truncated output.
+
+        Args:
+            content: Potentially truncated JSON string
+
+        Returns:
+            List of parsed segment dicts, or None if recovery fails
+        """
+        import json
+
+        # Find the start of the JSON array
+        bracket_pos = content.find("[")
+        if bracket_pos == -1:
+            return None
+
+        json_str = content[bracket_pos:]
+
+        # Try progressively trimming from the end to find valid JSON
+        # First try closing the array
+        for suffix in ["]", "}]", '"}]', '"}]']:
+            try:
+                parsed = json.loads(json_str.rstrip() + suffix)
+                if isinstance(parsed, list) and len(parsed) > 0:
+                    return parsed
+            except json.JSONDecodeError:
+                continue
+
+        # Try finding the last complete object by searching for "},"
+        last_complete = json_str.rfind("},")
+        if last_complete > 0:
+            try:
+                parsed = json.loads(json_str[: last_complete + 1] + "]")
+                if isinstance(parsed, list) and len(parsed) > 0:
+                    return parsed
+            except json.JSONDecodeError:
+                pass
+
+        # Try finding the last complete object ending with "}"
+        last_brace = json_str.rfind("}")
+        if last_brace > 0:
+            try:
+                parsed = json.loads(json_str[: last_brace + 1] + "]")
+                if isinstance(parsed, list) and len(parsed) > 0:
+                    return parsed
+            except json.JSONDecodeError:
+                pass
+
+        return None
 
     def _load_aligner(self):
         """Load Qwen forced aligner.
@@ -297,9 +525,11 @@ class ChalnaPipeline:
         self._load_aligner()
         _progress("loading_models", 1.0)
 
-        # Step 1: VibeVoice ASR (via API)
+        # Step 1: VibeVoice ASR (via vLLM API)
         _progress("transcribing", 0.0)
-        segments = self._call_vibevoice_api(audio_path, context, max_new_tokens)
+        segments = self._call_vibevoice_api(
+            audio_path, audio_info.duration_seconds, context, max_new_tokens
+        )
         _progress("transcribing", 1.0)
 
         # Check for empty transcription

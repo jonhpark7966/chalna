@@ -64,6 +64,8 @@ class IntermediateResults:
     aligned_segments: Optional[List[Segment]] = None
     # Stage 3: After LLM refinement (before final re-alignment)
     refined_segments: Optional[List[Segment]] = None
+    # Chunked ASR: per-chunk raw segments (before merging)
+    chunk_raw_segments: Optional[List[List[Segment]]] = None
     # Logs
     alignment_log: Optional[List[dict]] = None
     refinement_log: Optional[List[dict]] = None
@@ -76,6 +78,10 @@ class IntermediateResults:
             result["aligned_segments"] = [s.to_dict() for s in self.aligned_segments]
         if self.refined_segments:
             result["refined_segments"] = [s.to_dict() for s in self.refined_segments]
+        if self.chunk_raw_segments:
+            result["chunk_raw_segments"] = [
+                [s.to_dict() for s in chunk] for chunk in self.chunk_raw_segments
+            ]
         if self.alignment_log:
             result["alignment_log"] = self.alignment_log
         if self.refinement_log:

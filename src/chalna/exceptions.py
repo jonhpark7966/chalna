@@ -80,7 +80,7 @@ class ChalnaError(Exception):
 
 
 class AudioTooLongError(ChalnaError):
-    """Raised when audio duration exceeds the maximum allowed (1 hour)."""
+    """Raised when audio duration exceeds the maximum allowed (10 hours)."""
 
     error_code = ErrorCode.AUDIO_TOO_LONG
     http_status = 400
@@ -88,12 +88,12 @@ class AudioTooLongError(ChalnaError):
     def __init__(
         self,
         duration_seconds: float,
-        max_duration_seconds: float = 3600,
+        max_duration_seconds: float = 36000,
         cause: Optional[Exception] = None,
     ):
         message = (
             f"Audio duration ({duration_seconds:.1f}s) exceeds maximum "
-            f"allowed ({max_duration_seconds:.0f}s / 1 hour)"
+            f"allowed ({max_duration_seconds:.0f}s / 10 hours)"
         )
         details = {
             "duration_seconds": duration_seconds,

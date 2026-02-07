@@ -1,12 +1,13 @@
 """
-Chalna Pipeline - VibeVoice API + Qwen Forced Alignment.
+Chalna Pipeline - VibeVoice Direct Inference + Qwen Forced Alignment.
 """
 
 from __future__ import annotations
 
+import subprocess
 import tempfile
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 import torch
 
@@ -60,8 +61,10 @@ class ChalnaPipeline:
         self.use_llm_refinement = use_llm_refinement
         self.aligner_path = aligner_path
 
-        # Lazy loading (aligner only)
+        # Lazy loading
         self._aligner = None
+        self._vibevoice_model = None
+        self._vibevoice_processor = None
 
         # Auto-unload settings
         self._auto_unload = False  # Keep aligner loaded for fast subsequent requests
@@ -96,7 +99,7 @@ class ChalnaPipeline:
         return torch.float32
 
     def unload(self, force: bool = False) -> None:
-        """Unload aligner model from GPU memory.
+        """Unload models from GPU memory.
 
         Args:
             force: If True, force full cleanup (kept for API compatibility)
@@ -106,10 +109,218 @@ class ChalnaPipeline:
             self._aligner = None
             print("Qwen aligner unloaded.")
 
+        self._unload_vibevoice()
+
         # Clear CUDA cache
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
+
+    def _load_vibevoice(self) -> None:
+        """Load VibeVoice ASR model and processor."""
+        if self._vibevoice_model is not None:
+            return
+
+        try:
+            import sys
+            # Ensure external/VibeVoice is importable
+            vibevoice_path = Path(__file__).parent.parent.parent / "external" / "VibeVoice"
+            if vibevoice_path.exists() and str(vibevoice_path) not in sys.path:
+                sys.path.insert(0, str(vibevoice_path))
+
+            from vibevoice.modular.modeling_vibevoice_asr import VibeVoiceASRForConditionalGeneration
+            from vibevoice.processor.vibevoice_asr_processor import VibeVoiceASRProcessor
+
+            model_path = settings.vibevoice_model_path
+            print(f"Loading VibeVoice model from {model_path}...")
+
+            self._vibevoice_processor = VibeVoiceASRProcessor.from_pretrained(
+                model_path,
+                language_model_pretrained_name="Qwen/Qwen2.5-7B",
+            )
+
+            self._vibevoice_model = VibeVoiceASRForConditionalGeneration.from_pretrained(
+                model_path,
+                dtype=self.dtype,
+                device_map=self.device if self.device == "auto" else None,
+                attn_implementation="sdpa",
+                trust_remote_code=True,
+            )
+
+            if self.device != "auto":
+                self._vibevoice_model = self._vibevoice_model.to(self.device)
+
+            self._vibevoice_model.eval()
+            print("VibeVoice model loaded.")
+
+        except ImportError as e:
+            raise VibevoiceAPIError(
+                f"VibeVoice package not found. Install it: cd external/VibeVoice && pip install -e . Error: {e}",
+                cause=e,
+            )
+        except torch.cuda.OutOfMemoryError as e:
+            raise OutOfMemoryError(memory_type="GPU", cause=e)
+        except Exception as e:
+            raise VibevoiceAPIError(f"Failed to load VibeVoice model: {e}", cause=e)
+
+    def _unload_vibevoice(self) -> None:
+        """Unload VibeVoice model from GPU memory."""
+        if self._vibevoice_model is not None:
+            del self._vibevoice_model
+            self._vibevoice_model = None
+            print("VibeVoice model unloaded.")
+        if self._vibevoice_processor is not None:
+            del self._vibevoice_processor
+            self._vibevoice_processor = None
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+
+    def _extract_audio_chunk(self, audio_path: Path, start: float, duration: float) -> Path:
+        """Extract an audio chunk using ffmpeg.
+
+        Args:
+            audio_path: Source audio file
+            start: Start time in seconds
+            duration: Duration in seconds
+
+        Returns:
+            Path to temporary WAV file with extracted chunk
+        """
+        try:
+            tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            tmp_path = Path(tmp.name)
+            tmp.close()
+        except OSError as e:
+            raise TempFileError(operation="create chunk temp file", cause=e)
+
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-ss", str(start),
+            "-i", str(audio_path),
+            "-t", str(duration),
+            "-vn",
+            "-acodec", "pcm_s16le",
+            "-ar", "16000",
+            "-ac", "1",
+            str(tmp_path),
+        ], capture_output=True, check=True)
+
+        return tmp_path
+
+    def _call_vibevoice_chunked(
+        self,
+        audio_path: Path,
+        total_duration: float,
+        context: Optional[str],
+        max_new_tokens: int,
+        progress_callback: Optional[Callable],
+    ) -> Tuple[List[Segment], List[List[Segment]]]:
+        """Run VibeVoice inference in chunks to avoid GPU OOM on long audio.
+
+        Splits audio into ~10min chunks, processes each sequentially,
+        and merges results with proper timestamp offsets.
+
+        Args:
+            audio_path: Path to audio file
+            total_duration: Total audio duration in seconds
+            context: Optional context/hotwords
+            max_new_tokens: Max tokens per chunk generation
+            progress_callback: Optional callback(stage, progress, **kwargs)
+
+        Returns:
+            (all_segments, per_chunk_segments) tuple
+        """
+        CHUNK_DURATION = 600   # 10 minutes
+        MIN_TAIL = 120         # Merge tail if <2min remains
+
+        self._load_vibevoice()
+
+        all_segments: List[Segment] = []
+        per_chunk: List[List[Segment]] = []
+        current_start = 0.0
+        chunk_index = 0
+
+        # Calculate total chunks for progress reporting
+        total_chunks = 0
+        pos = 0.0
+        while pos < total_duration:
+            chunk_end = min(pos + CHUNK_DURATION, total_duration)
+            if total_duration - chunk_end < MIN_TAIL:
+                chunk_end = total_duration
+            pos = chunk_end
+            total_chunks += 1
+
+        print(f"Chunked transcription: {total_duration:.0f}s audio → {total_chunks} chunks")
+
+        while current_start < total_duration:
+            chunk_end = min(current_start + CHUNK_DURATION, total_duration)
+            # If remaining audio after this chunk is less than MIN_TAIL, absorb it
+            if total_duration - chunk_end < MIN_TAIL:
+                chunk_end = total_duration
+
+            chunk_duration = chunk_end - current_start
+            chunk_index += 1
+
+            print(f"\n  Chunk {chunk_index}/{total_chunks}: "
+                  f"{current_start:.1f}s → {chunk_end:.1f}s ({chunk_duration:.1f}s)")
+
+            # Extract chunk audio
+            chunk_path = self._extract_audio_chunk(audio_path, current_start, chunk_duration)
+
+            try:
+                # Run VibeVoice on this chunk (no continuation - chunking handles coverage)
+                chunk_segments = self._call_vibevoice(
+                    chunk_path, chunk_duration, context, max_new_tokens,
+                    max_continuations=0,
+                )
+            finally:
+                chunk_path.unlink(missing_ok=True)
+
+            # Apply timestamp offset
+            for seg in chunk_segments:
+                seg.start_time += current_start
+                seg.end_time += current_start
+
+            # Determine incomplete segments at chunk boundary
+            # If last segment's end_time is very close to chunk_end, it may be cut off
+            if chunk_end < total_duration and chunk_segments:
+                last_seg = chunk_segments[-1]
+                if last_seg.end_time >= chunk_end - 1.0:
+                    # Drop incomplete segment - will be re-processed in next chunk
+                    print(f"    Dropping incomplete tail segment: "
+                          f"end={last_seg.end_time:.2f}s (chunk_end={chunk_end:.1f}s)")
+                    chunk_segments = chunk_segments[:-1]
+
+            # Determine next chunk start point
+            if chunk_segments:
+                next_start = chunk_segments[-1].end_time
+            else:
+                next_start = chunk_end
+
+            # Store per-chunk results
+            per_chunk.append(list(chunk_segments))
+            all_segments.extend(chunk_segments)
+
+            print(f"    Got {len(chunk_segments)} segments, "
+                  f"total so far: {len(all_segments)}")
+
+            # Progress callback
+            if progress_callback:
+                progress = chunk_index / total_chunks
+                progress_callback(
+                    "transcribing", progress,
+                    chunk=chunk_index, total_chunks=total_chunks,
+                )
+
+            current_start = next_start
+
+        # Re-index all segments
+        for i, seg in enumerate(all_segments, start=1):
+            seg.index = i
+
+        return all_segments, per_chunk
 
     def is_loaded(self) -> bool:
         """Check if aligner model is currently loaded."""
@@ -124,37 +335,19 @@ class ChalnaPipeline:
         """
         self._auto_unload = enabled
 
-    @staticmethod
-    def _guess_mime_type(path: Path) -> str:
-        """Guess MIME type from file extension."""
-        ext = path.suffix.lower()
-        mime_map = {
-            ".wav": "audio/wav",
-            ".mp3": "audio/mpeg",
-            ".m4a": "audio/mp4",
-            ".mp4": "video/mp4",
-            ".m4v": "video/mp4",
-            ".mov": "video/mp4",
-            ".webm": "video/webm",
-            ".flac": "audio/flac",
-            ".ogg": "audio/ogg",
-            ".opus": "audio/ogg",
-            ".aac": "audio/aac",
-            ".wma": "audio/x-ms-wma",
-        }
-        return mime_map.get(ext, "application/octet-stream")
-
-    def _call_vibevoice_api(
+    def _call_vibevoice(
         self,
         audio_path: Path,
         duration: float,
         context: Optional[str] = None,
-        max_new_tokens: int = 65536,
+        max_new_tokens: int = 32768,
+        max_continuations: int = 10,
     ) -> List[Segment]:
-        """Call VibeVoice vLLM API to transcribe audio.
+        """Run VibeVoice ASR inference directly on audio.
 
-        Uses the OpenAI-compatible /v1/chat/completions endpoint with
-        base64-encoded audio.
+        Loads the model, runs generate(), parses output, and handles
+        continuation if the output is truncated due to max_new_tokens.
+        The model stays loaded until explicitly unloaded (to allow continuation).
 
         Args:
             audio_path: Path to audio file
@@ -163,135 +356,80 @@ class ChalnaPipeline:
             max_new_tokens: Maximum tokens for generation
 
         Returns:
-            List of Segment objects from API response
+            List of Segment objects
 
         Raises:
-            VibevoiceAPIError: If API call fails
+            VibevoiceAPIError: If inference fails
         """
-        import base64
-        import json
+        # Load model (lazy, stays loaded for continuation)
+        self._load_vibevoice()
 
-        import httpx
+        processor = self._vibevoice_processor
+        model = self._vibevoice_model
 
-        url = f"{settings.vibevoice_api_url}/v1/chat/completions"
-
-        # Encode audio as base64 data URL
+        # Prepare inputs via processor (handles audio loading, resampling, tokenization)
         try:
-            audio_bytes = audio_path.read_bytes()
-            audio_b64 = base64.b64encode(audio_bytes).decode("ascii")
+            inputs = processor(
+                audio=str(audio_path),
+                sampling_rate=None,
+                return_tensors="pt",
+                padding=True,
+                add_generation_prompt=True,
+                context_info=context,
+            )
         except Exception as e:
-            raise VibevoiceAPIError(f"Failed to read audio file: {e}", cause=e)
+            raise VibevoiceAPIError(f"Failed to process audio: {e}", cause=e)
 
-        mime = self._guess_mime_type(audio_path)
-        data_url = f"data:{mime};base64,{audio_b64}"
+        # Move inputs to device
+        device = next(model.parameters()).device
+        inputs = {
+            k: v.to(device) if isinstance(v, torch.Tensor) else v
+            for k, v in inputs.items()
+        }
 
-        # Build prompt with sentence segmentation instruction
-        sentence_instruction = """
-IMPORTANT SEGMENTATION RULES:
-- Create a NEW segment for EACH complete sentence
-- Split at sentence boundaries: . ? ! 。？！
-- Each segment should contain exactly ONE sentence
-- Maintain Speaker ID for tracking who said what
-- Provide accurate Start time and End time for each sentence
-"""
+        input_length = inputs["input_ids"].shape[1]
 
-        show_keys = ["Start time", "End time", "Speaker ID", "Content"]
-        if context and context.strip():
-            prompt_text = (
-                f"This is a {duration:.2f} seconds audio, "
-                f"with extra info: {context.strip()}\n\n"
-                f"{sentence_instruction}\n\n"
-                f"Please transcribe it with these keys: " + ", ".join(show_keys)
-            )
-        else:
-            prompt_text = (
-                f"This is a {duration:.2f} seconds audio.\n\n"
-                f"{sentence_instruction}\n\n"
-                f"Please transcribe it with these keys: " + ", ".join(show_keys)
-            )
-
-        system_content = "You are a helpful assistant that transcribes audio input into text output in JSON format."
-
-        messages = [
-            {
-                "role": "system",
-                "content": system_content,
-            },
-            {
-                "role": "user",
-                "content": [
-                    {"type": "audio_url", "audio_url": {"url": data_url}},
-                    {"type": "text", "text": prompt_text},
-                ],
-            },
-        ]
+        # Generation config
+        generation_config = {
+            "max_new_tokens": max_new_tokens,
+            "pad_token_id": processor.pad_id,
+            "eos_token_id": processor.tokenizer.eos_token_id,
+            "do_sample": False,
+            "temperature": None,
+        }
 
         all_segments: List[Segment] = []
-        max_continuations = 10  # Safety limit to prevent infinite loops
 
         for attempt in range(max_continuations + 1):
-            payload = {
-                "model": settings.vibevoice_model_name,
-                "messages": messages,
-                "max_tokens": max_new_tokens,
-                "temperature": 0.0,
-                "stream": False,
-                "top_p": 1.0,
-                "repetition_penalty": 1.0,
-            }
-
             try:
-                with httpx.Client(timeout=600.0) as client:
-                    response = client.post(url, json=payload)
-            except httpx.ConnectError as e:
-                raise VibevoiceAPIError(
-                    f"Cannot connect to VibeVoice vLLM API at {settings.vibevoice_api_url}. "
-                    f"Is the server running? (start with: chalna serve-vibevoice)",
-                    cause=e,
-                )
-            except httpx.TimeoutException as e:
-                raise VibevoiceAPIError(
-                    f"VibeVoice API request timed out ({settings.vibevoice_api_url})",
-                    cause=e,
-                )
+                with torch.no_grad():
+                    output_ids = model.generate(**inputs, **generation_config)
+            except torch.cuda.OutOfMemoryError as e:
+                raise OutOfMemoryError(memory_type="GPU", cause=e)
             except Exception as e:
-                raise VibevoiceAPIError(
-                    f"VibeVoice API request failed: {e}",
-                    cause=e,
-                )
+                raise VibevoiceAPIError(f"VibeVoice generation failed: {e}", cause=e)
 
-            if response.status_code != 200:
-                raise VibevoiceAPIError(
-                    f"VibeVoice API returned HTTP {response.status_code}: {response.text}"
-                )
+            # Decode output (skip input tokens)
+            generated_ids = output_ids[0, input_length:]
 
-            # Parse OpenAI-compatible response
-            try:
-                result = response.json()
-                content = result["choices"][0]["message"]["content"]
-                finish_reason = result["choices"][0].get("finish_reason", "stop")
-            except (KeyError, IndexError) as e:
-                raise VibevoiceAPIError(
-                    f"Unexpected vLLM response structure: {e}",
-                    cause=e,
-                )
-            except Exception as e:
-                raise VibevoiceAPIError(
-                    f"Failed to parse VibeVoice API response: {e}",
-                    cause=e,
-                )
+            # Trim at EOS if present
+            eos_positions = (generated_ids == processor.tokenizer.eos_token_id).nonzero(as_tuple=True)[0]
+            hit_eos = len(eos_positions) > 0
+            if hit_eos:
+                generated_ids = generated_ids[: eos_positions[0] + 1]
+
+            generated_text = processor.decode(generated_ids, skip_special_tokens=True)
 
             # Parse segments from this response
-            segments = self._parse_vibevoice_response(content)
+            segments = self._parse_vibevoice_response(generated_text)
             all_segments.extend(segments)
 
-            # If response completed normally, we're done
-            if finish_reason != "length":
+            # If EOS was hit, generation completed normally
+            if hit_eos:
                 break
 
-            # Response was truncated — request continuation
+            # If no EOS and we generated max_new_tokens, output was truncated
             if not segments:
-                # Truncated but couldn't parse any segments, stop
                 break
 
             last_seg = segments[-1]
@@ -300,7 +438,9 @@ IMPORTANT SEGMENTATION RULES:
                 f"({len(all_segments)} segments so far), requesting continuation..."
             )
 
-            # Build continuation prompt: ask to continue from where it stopped
+            # For continuation, we need to feed back the generated text and
+            # ask to continue. Build new input by encoding a continuation prompt.
+            show_keys = ["Start time", "End time", "Speaker ID", "Content"]
             continuation_text = (
                 f"The previous transcription was cut off at {last_seg.end_time:.2f}s. "
                 f"Please continue transcribing from {last_seg.end_time:.2f}s to the end "
@@ -308,9 +448,41 @@ IMPORTANT SEGMENTATION RULES:
                 f"with the same keys: " + ", ".join(show_keys)
             )
 
-            # Append assistant's truncated response and user's continuation request
-            messages.append({"role": "assistant", "content": content})
-            messages.append({"role": "user", "content": continuation_text})
+            # Build continuation input: append assistant response + user continuation
+            # Use tokenizer to encode the multi-turn continuation
+            try:
+                continuation_ids = processor.tokenizer.encode(
+                    generated_text + processor.tokenizer.eos_token
+                    + "<|im_start|>user\n" + continuation_text + "<|im_end|>\n"
+                    + "<|im_start|>assistant\n",
+                    add_special_tokens=False,
+                    return_tensors="pt",
+                )
+                # Append to existing output for next generation
+                inputs["input_ids"] = torch.cat(
+                    [output_ids[0:1], continuation_ids.to(device)], dim=1
+                )
+                # Extend attention mask
+                if "attention_mask" in inputs:
+                    extra_mask = torch.ones(
+                        1, continuation_ids.shape[1],
+                        dtype=inputs["attention_mask"].dtype,
+                        device=device,
+                    )
+                    inputs["attention_mask"] = torch.cat(
+                        [inputs["attention_mask"], extra_mask], dim=1
+                    )
+                input_length = inputs["input_ids"].shape[1]
+
+                # Remove speech_tensors etc. from inputs for continuation
+                # (audio is already encoded in the model's KV cache won't work
+                # with generate() re-run, so we clear speech-related inputs)
+                for key in ["speech_tensors", "speech_masks", "acoustic_input_mask"]:
+                    inputs.pop(key, None)
+
+            except Exception as e:
+                print(f"  Warning: continuation encoding failed: {e}, stopping.")
+                break
 
         # Re-index all collected segments
         for i, seg in enumerate(all_segments, start=1):
@@ -364,18 +536,27 @@ IMPORTANT SEGMENTATION RULES:
             )
 
         # Convert to Segment objects
+        # Model may use short keys ("Start", "End", "Speaker") or
+        # full keys ("Start time", "End time", "Speaker ID") depending on prompt
         segments = []
         for i, item in enumerate(api_segments, start=1):
             text = item.get("Content", "")
             # Skip environmental sounds and silence markers
             if text.startswith("[") and text.endswith("]"):
                 continue
+
+            start = item.get("Start time", item.get("Start", 0))
+            end = item.get("End time", item.get("End", 0))
+            speaker = item.get("Speaker ID", item.get("Speaker"))
+            if speaker is not None:
+                speaker = str(speaker)
+
             segments.append(Segment(
                 index=i,
-                start_time=float(item.get("Start time", 0)),
-                end_time=float(item.get("End time", 0)),
+                start_time=float(start),
+                end_time=float(end),
                 text=text,
-                speaker_id=item.get("Speaker ID"),
+                speaker_id=speaker,
             ))
 
         # Re-index after filtering
@@ -507,9 +688,9 @@ IMPORTANT SEGMENTATION RULES:
         if not audio_path.exists():
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
-        def _progress(stage: str, value: float):
+        def _progress(stage: str, value: float, **extra):
             if progress_callback:
-                progress_callback(stage, value)
+                progress_callback(stage, value, **extra)
 
         # Step 0: Validate audio file (duration, format, integrity)
         _progress("validating", 0.0)
@@ -520,17 +701,30 @@ IMPORTANT SEGMENTATION RULES:
         required_mb = estimate_temp_space_required(audio_info)
         check_disk_space(required_mb)
 
+        # Step 1: VibeVoice ASR (direct inference, loads model)
+        # Use chunked processing for long audio (>11 min) to avoid GPU OOM
+        CHUNK_THRESHOLD = 660  # 11 minutes
+        _progress("transcribing", 0.0)
+        chunk_raw = None
+        try:
+            if audio_info.duration_seconds > CHUNK_THRESHOLD:
+                segments, chunk_raw = self._call_vibevoice_chunked(
+                    audio_path, audio_info.duration_seconds,
+                    context, max_new_tokens, progress_callback,
+                )
+            else:
+                segments = self._call_vibevoice(
+                    audio_path, audio_info.duration_seconds, context, max_new_tokens
+                )
+        finally:
+            # Always unload VibeVoice to free GPU (even on error)
+            self._unload_vibevoice()
+        _progress("transcribing", 1.0)
+
         # Load aligner model
         _progress("loading_models", 0.0)
         self._load_aligner()
         _progress("loading_models", 1.0)
-
-        # Step 1: VibeVoice ASR (via vLLM API)
-        _progress("transcribing", 0.0)
-        segments = self._call_vibevoice_api(
-            audio_path, audio_info.duration_seconds, context, max_new_tokens
-        )
-        _progress("transcribing", 1.0)
 
         # Check for empty transcription
         if not segments:
@@ -620,6 +814,7 @@ IMPORTANT SEGMENTATION RULES:
             raw_segments=self._raw_segments,
             aligned_segments=self._aligned_segments,
             refined_segments=self._refined_segments,
+            chunk_raw_segments=chunk_raw,
             alignment_log=self._last_alignment_log,
             refinement_log=self._refinement_log,
         )
@@ -887,8 +1082,8 @@ IMPORTANT SEGMENTATION RULES:
 
             subprocess.run([
                 "ffmpeg", "-y",
-                "-i", str(audio_path),
                 "-ss", str(original_start),
+                "-i", str(audio_path),
                 "-t", str(original_duration),
                 "-vn",
                 "-acodec", "pcm_s16le",
@@ -1003,8 +1198,8 @@ IMPORTANT SEGMENTATION RULES:
 
             subprocess.run([
                 "ffmpeg", "-y",
-                "-i", str(audio_path),
                 "-ss", str(original_start),
+                "-i", str(audio_path),
                 "-t", str(original_duration),
                 "-vn",
                 "-acodec", "pcm_s16le",
@@ -1309,8 +1504,8 @@ IMPORTANT SEGMENTATION RULES:
 
                 subprocess.run([
                     "ffmpeg", "-y",
-                    "-i", str(audio_path),
                     "-ss", str(original_start),
+                    "-i", str(audio_path),
                     "-t", str(original_duration),
                     "-vn",
                     "-acodec", "pcm_s16le",

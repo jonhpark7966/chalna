@@ -6,8 +6,7 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    vibevoice_api_url: str = "http://localhost:8001"
-    vibevoice_model_name: str = "vibevoice"
+    vibevoice_model_path: str = "microsoft/VibeVoice-ASR"
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 

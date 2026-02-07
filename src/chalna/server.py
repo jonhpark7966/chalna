@@ -110,6 +110,10 @@ class Job(BaseModel):
     raw_srt: Optional[str] = None  # Stage 1: VibeVoice raw
     aligned_srt: Optional[str] = None  # Stage 2: After forced alignment
     refined_srt: Optional[str] = None  # Stage 3: After LLM refinement
+    # Chunk observability
+    chunks_completed: int = 0
+    total_chunks: int = 0
+    chunk_raw_srts: Dict[int, str] = Field(default_factory=dict)
 
 
 class ErrorResponse(BaseModel):
@@ -147,6 +151,9 @@ class JobResponse(BaseModel):
     raw_srt: Optional[str] = None
     aligned_srt: Optional[str] = None
     refined_srt: Optional[str] = None
+    # Chunk observability
+    chunks_completed: int = 0
+    total_chunks: int = 0
 
 
 class HealthResponse(BaseModel):
@@ -187,8 +194,6 @@ async def health():
     """
     Check server health and model status.
     """
-    from chalna.settings import settings
-
     gpu = None
     try:
         import torch
@@ -197,25 +202,15 @@ async def health():
     except ImportError:
         pass
 
-    # Check model/API status
+    # Check model status
     models = {
-        "vibevoice_api": "unknown",
+        "vibevoice": "not_loaded",
         "qwen_aligner": "not_loaded",
     }
 
-    # Check VibeVoice vLLM API connectivity
-    try:
-        import httpx
-        with httpx.Client(timeout=5.0) as client:
-            resp = client.get(f"{settings.vibevoice_api_url}/v1/models")
-            if resp.status_code == 200:
-                models["vibevoice_api"] = "available"
-            else:
-                models["vibevoice_api"] = "error"
-    except Exception:
-        models["vibevoice_api"] = "unavailable"
-
     if _pipeline is not None:
+        if _pipeline._vibevoice_model is not None:
+            models["vibevoice"] = "loaded"
         if _pipeline._aligner is not None:
             models["qwen_aligner"] = "loaded"
 
@@ -451,6 +446,38 @@ async def get_job(job_id: str):
         raw_srt=job.raw_srt,
         aligned_srt=job.aligned_srt,
         refined_srt=job.refined_srt,
+        chunks_completed=job.chunks_completed,
+        total_chunks=job.total_chunks,
+    )
+
+
+@app.get("/jobs/{job_id}/chunks/{chunk_index}")
+async def get_chunk_result(job_id: str, chunk_index: int):
+    """
+    Get raw ASR SRT result for a specific chunk.
+
+    Returns the per-chunk VibeVoice output before merging/alignment.
+    Available once the chunk has been processed (check chunks_completed in job status).
+    """
+    if job_id not in _jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    job = _jobs[job_id]
+
+    if chunk_index not in job.chunk_raw_srts:
+        if chunk_index < 0 or chunk_index >= job.total_chunks:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Chunk index {chunk_index} out of range (0-{job.total_chunks - 1})",
+            )
+        raise HTTPException(
+            status_code=404,
+            detail=f"Chunk {chunk_index} not yet available (completed: {job.chunks_completed}/{job.total_chunks})",
+        )
+
+    return PlainTextResponse(
+        content=job.chunk_raw_srts[chunk_index],
+        media_type="text/plain; charset=utf-8",
     )
 
 
@@ -473,14 +500,20 @@ async def _process_job(
     """Process transcription job in background."""
     job = _jobs[job_id]
 
-    def progress_callback(stage: str, progress: float):
+    def progress_callback(stage: str, progress: float, **kwargs):
         """Update job progress from pipeline."""
         entry = {
             "stage": stage,
             "progress": progress,
             "timestamp": datetime.utcnow().isoformat(),
+            **kwargs,
         }
         job.progress_history.append(entry)
+
+        # Track chunk progress
+        if "chunk" in kwargs:
+            job.chunks_completed = kwargs["chunk"]
+            job.total_chunks = kwargs.get("total_chunks", 0)
 
         # Map stage progress to overall job progress
         stage_weights = {
@@ -540,6 +573,13 @@ async def _process_job(
                 job.refined_srt = segments_to_srt(
                     result.intermediate.refined_segments, include_speaker=True
                 )
+
+            # Store per-chunk raw SRTs for observability
+            if result.intermediate.chunk_raw_segments:
+                for i, chunk_segs in enumerate(result.intermediate.chunk_raw_segments):
+                    job.chunk_raw_srts[i] = segments_to_srt(
+                        chunk_segs, include_speaker=True
+                    )
 
         # Format output
         if output_format == "json":

@@ -6,7 +6,7 @@ After=network.target
 Type=simple
 User=jonhpark
 WorkingDirectory=/home/jonhpark/workspace/chalna
-Environment="PATH=/home/jonhpark/workspace/chalna/venv/bin"
+Environment="PATH=/home/jonhpark/workspace/chalna/venv/bin:/usr/bin:/usr/local/bin"
 ExecStart=/home/jonhpark/workspace/chalna/venv/bin/uvicorn chalna.server:app --host 0.0.0.0 --port 7861
 Restart=always
 RestartSec=10

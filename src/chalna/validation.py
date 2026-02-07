@@ -24,8 +24,8 @@ from chalna.exceptions import (
 )
 
 
-# Maximum audio duration in seconds (1 hour)
-MAX_DURATION_SECONDS = 3600
+# Maximum audio duration in seconds (10 hours)
+MAX_DURATION_SECONDS = 36000
 
 # Maximum file size in MB (2GB)
 MAX_FILE_SIZE_MB = 2048

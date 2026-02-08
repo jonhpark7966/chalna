@@ -67,6 +67,12 @@ _pipeline = None
 # Job storage (in-memory, for demo)
 _jobs: Dict[str, "Job"] = {}
 
+# Job queue infrastructure (FIFO single worker)
+_job_queue: asyncio.Queue = asyncio.Queue()
+_queue_worker_task: Optional[asyncio.Task] = None
+_job_events: Dict[str, asyncio.Event] = {}  # sync endpoint wait
+_job_params: Dict[str, Dict[str, Any]] = {}  # queued job parameters
+
 
 def get_pipeline():
     """Get or create pipeline instance."""
@@ -80,6 +86,29 @@ def get_pipeline():
         _pipeline.set_auto_unload(auto_unload)
 
     return _pipeline
+
+
+def _compute_queue_position(job_id: str) -> Optional[int]:
+    """Compute queue position for a job.
+
+    Returns:
+        None if completed/failed, 0 if processing, 1+ if queued (1 = next).
+    """
+    job = _jobs.get(job_id)
+    if job is None:
+        return None
+    if job.status in (JobStatus.COMPLETED, JobStatus.FAILED):
+        return None
+    if job.status == JobStatus.PROCESSING:
+        return 0
+    # QUEUED: count how many QUEUED jobs were created before this one
+    position = 1
+    for other in _jobs.values():
+        if other.job_id == job_id:
+            continue
+        if other.status == JobStatus.QUEUED and other.created_at < job.created_at:
+            position += 1
+    return position
 
 
 # =============================================================================
@@ -98,6 +127,7 @@ class Job(BaseModel):
     status: JobStatus
     progress: float = 0.0
     created_at: datetime
+    started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     result: Optional[str] = None
     error: Optional[str] = None
@@ -114,6 +144,8 @@ class Job(BaseModel):
     chunks_completed: int = 0
     total_chunks: int = 0
     chunk_raw_srts: Dict[int, str] = Field(default_factory=dict)
+    # Refinement status
+    refined: Optional[bool] = None
 
 
 class ErrorResponse(BaseModel):
@@ -154,6 +186,11 @@ class JobResponse(BaseModel):
     # Chunk observability
     chunks_completed: int = 0
     total_chunks: int = 0
+    # Refinement status
+    refined: Optional[bool] = None
+    # Queue info
+    queue_position: Optional[int] = None
+    started_at: Optional[datetime] = None
 
 
 class HealthResponse(BaseModel):
@@ -178,6 +215,7 @@ class MetadataModel(BaseModel):
     speakers: list[str] = Field(default_factory=list)
     model_version: str = "vibevoice-asr"
     aligned: bool = True
+    refined: bool = True
 
 
 class TranscriptionResultModel(BaseModel):
@@ -262,7 +300,8 @@ async def transcribe(
     """
     Transcribe audio/video file to subtitles (synchronous).
 
-    Returns SRT or JSON based on output_format parameter.
+    Routes through the job queue to prevent concurrent GPU access.
+    Blocks until the job completes.
 
     Error responses follow the structure:
     {
@@ -284,71 +323,64 @@ async def transcribe(
         tmp.write(content)
         tmp_path = Path(tmp.name)
 
+    # Validate audio file upfront (fail fast before queuing)
     try:
-        # Validate audio file first (duration, format, integrity)
-        # This will raise ChalnaError exceptions handled by the exception handler
         validate_audio_file(tmp_path)
-
-        # Get pipeline
-        pipeline = get_pipeline()
-        pipeline.use_alignment = use_alignment
-        pipeline.use_llm_refinement = use_llm_refinement
-
-        # Run transcription
-        result = pipeline.transcribe(
-            audio_path=tmp_path,
-            context=context,
-            language=language,
-        )
-
-        # Format output
-        if output_format == "json":
-            response_data = result.to_dict()
-
-            # Include logs if requested (use result.intermediate for thread safety)
-            if include_logs and result.intermediate:
-                response_data["alignment_log"] = result.intermediate.alignment_log
-                response_data["refinement_log"] = result.intermediate.refinement_log
-
-            # Include intermediate results if requested
-            if include_intermediate and result.intermediate:
-                from chalna.srt_utils import segments_to_srt
-
-                if result.intermediate.raw_segments:
-                    response_data["raw_srt"] = segments_to_srt(
-                        result.intermediate.raw_segments, include_speaker=True
-                    )
-
-                if result.intermediate.aligned_segments:
-                    response_data["aligned_srt"] = segments_to_srt(
-                        result.intermediate.aligned_segments, include_speaker=True
-                    )
-
-                if result.intermediate.refined_segments:
-                    response_data["refined_srt"] = segments_to_srt(
-                        result.intermediate.refined_segments, include_speaker=True
-                    )
-
-            return JSONResponse(
-                content=response_data,
-                media_type="application/json",
-            )
-        else:
-            return PlainTextResponse(
-                content=result.to_srt(include_speaker=include_speaker),
-                media_type="text/plain; charset=utf-8",
-            )
-
     except ChalnaError:
-        # Re-raise ChalnaError to be handled by the exception handler
+        tmp_path.unlink(missing_ok=True)
         raise
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    # Create internal job and enqueue
+    job_id = str(uuid.uuid4())
+    job = Job(
+        job_id=job_id,
+        status=JobStatus.QUEUED,
+        created_at=datetime.utcnow(),
+        output_format=output_format,
+    )
+    _jobs[job_id] = job
 
+    _job_params[job_id] = dict(
+        audio_path=tmp_path,
+        context=context,
+        language=language,
+        include_speaker=include_speaker,
+        use_alignment=use_alignment,
+        use_llm_refinement=use_llm_refinement,
+        output_format=output_format,
+        include_logs=include_logs,
+        include_intermediate=include_intermediate,
+    )
+
+    event = asyncio.Event()
+    _job_events[job_id] = event
+    await _job_queue.put(job_id)
+
+    # Wait for job to complete
+    await event.wait()
+
+    # Build response from completed job
+    try:
+        if job.status == JobStatus.FAILED:
+            if job.error_details and "http_status" in job.error_details:
+                return JSONResponse(
+                    status_code=job.error_details["http_status"],
+                    content={k: v for k, v in job.error_details.items() if k != "http_status"},
+                )
+            raise HTTPException(status_code=500, detail=job.error or "Unknown error")
+
+        # COMPLETED — return result based on output_format
+        if output_format == "json":
+            result_data = json.loads(job.result) if job.result else {}
+            return JSONResponse(content=result_data, media_type="application/json")
+        else:
+            return PlainTextResponse(
+                content=job.result or "",
+                media_type="text/plain; charset=utf-8",
+            )
     finally:
-        # Cleanup
-        tmp_path.unlink(missing_ok=True)
+        # Cleanup sync job from storage (no need to poll)
+        _jobs.pop(job_id, None)
 
 
 @app.post("/transcribe/async", response_model=TranscribeResponse)
@@ -397,21 +429,19 @@ async def transcribe_async(
     )
     _jobs[job_id] = job
 
-    # Start background task
-    asyncio.create_task(
-        _process_job(
-            job_id=job_id,
-            audio_path=tmp_path,
-            context=context,
-            language=language,
-            include_speaker=include_speaker,
-            use_alignment=use_alignment,
-            use_llm_refinement=use_llm_refinement,
-            output_format=output_format,
-            include_logs=include_logs,
-            include_intermediate=include_intermediate,
-        )
+    # Enqueue for processing
+    _job_params[job_id] = dict(
+        audio_path=tmp_path,
+        context=context,
+        language=language,
+        include_speaker=include_speaker,
+        use_alignment=use_alignment,
+        use_llm_refinement=use_llm_refinement,
+        output_format=output_format,
+        include_logs=include_logs,
+        include_intermediate=include_intermediate,
     )
+    await _job_queue.put(job_id)
 
     # Estimate time (rough: 1 min audio = 10 sec processing)
     file_size_mb = len(content) / (1024 * 1024)
@@ -448,6 +478,9 @@ async def get_job(job_id: str):
         refined_srt=job.refined_srt,
         chunks_completed=job.chunks_completed,
         total_chunks=job.total_chunks,
+        refined=job.refined,
+        queue_position=_compute_queue_position(job_id),
+        started_at=job.started_at,
     )
 
 
@@ -484,6 +517,30 @@ async def get_chunk_result(job_id: str, chunk_index: int):
 # =============================================================================
 # Background Tasks
 # =============================================================================
+
+async def _queue_worker():
+    """Single FIFO worker that processes jobs sequentially."""
+    while True:
+        job_id = await _job_queue.get()
+        try:
+            job = _jobs.get(job_id)
+            if job is None or job.status != JobStatus.QUEUED:
+                continue
+            params = _job_params.pop(job_id, None)
+            if params is None:
+                continue
+            await _process_job(job_id=job_id, **params)
+        except Exception as e:
+            job = _jobs.get(job_id)
+            if job and job.status not in (JobStatus.COMPLETED, JobStatus.FAILED):
+                job.status = JobStatus.FAILED
+                job.error = f"Queue worker error: {e}"
+        finally:
+            _job_queue.task_done()
+            event = _job_events.pop(job_id, None)
+            if event:
+                event.set()
+
 
 async def _process_job(
     job_id: str,
@@ -529,6 +586,7 @@ async def _process_job(
 
     try:
         job.status = JobStatus.PROCESSING
+        job.started_at = datetime.utcnow()
         job.progress = 0.0
 
         # Get pipeline
@@ -596,6 +654,7 @@ async def _process_job(
         else:
             job.result = result.to_srt(include_speaker=include_speaker)
 
+        job.refined = result.metadata.refined
         job.status = JobStatus.COMPLETED
         job.progress = 1.0
         job.completed_at = datetime.utcnow()
@@ -606,7 +665,7 @@ async def _process_job(
     except ChalnaError as e:
         job.status = JobStatus.FAILED
         job.error = e.message
-        job.error_details = e.to_dict()
+        job.error_details = {**e.to_dict(), "http_status": e.http_status}
         _save_job_error(job)
 
     except Exception as e:
@@ -722,14 +781,37 @@ def _save_job_error(job: Job) -> None:
 
 @app.on_event("startup")
 async def startup():
-    """Preload models on startup."""
-    # Optionally preload models here
-    # get_pipeline()
+    """Start queue worker and preload models."""
+    global _queue_worker_task
+    _queue_worker_task = asyncio.create_task(_queue_worker())
+    print(f"Job queue worker started")
     print(f"Results will be saved to: {RESULTS_DIR}")
 
 
 @app.on_event("shutdown")
 async def shutdown():
     """Cleanup on shutdown."""
-    # Cleanup jobs
+    global _queue_worker_task
+
+    # Cancel queue worker
+    if _queue_worker_task is not None:
+        _queue_worker_task.cancel()
+        try:
+            await _queue_worker_task
+        except asyncio.CancelledError:
+            pass
+        _queue_worker_task = None
+
+    # Cleanup temp files from pending jobs
+    for job_id, params in _job_params.items():
+        audio_path = params.get("audio_path")
+        if audio_path and hasattr(audio_path, "unlink"):
+            audio_path.unlink(missing_ok=True)
+    _job_params.clear()
+
+    # Wake up any waiting sync events
+    for event in _job_events.values():
+        event.set()
+    _job_events.clear()
+
     _jobs.clear()

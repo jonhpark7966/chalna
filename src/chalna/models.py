@@ -43,6 +43,7 @@ class TranscriptionMetadata:
     speakers: List[str] = field(default_factory=list)
     model_version: str = "vibevoice-asr"
     aligned: bool = True  # whether Qwen alignment was applied
+    refined: bool = True  # whether LLM refinement was applied
 
     def to_dict(self) -> dict:
         return {
@@ -51,6 +52,7 @@ class TranscriptionMetadata:
             "speakers": self.speakers,
             "model_version": self.model_version,
             "aligned": self.aligned,
+            "refined": self.refined,
         }
 
 

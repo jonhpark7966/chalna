@@ -154,7 +154,8 @@ Content-Type: `application/json`
     "language": "ko",
     "speakers": ["Speaker 1", "Speaker 2"],
     "model_version": "vibevoice-asr",
-    "aligned": true
+    "aligned": true,
+    "refined": true
   }
 }
 ```
@@ -281,7 +282,10 @@ Get status of an async transcription job.
   "aligned_srt": null,
   "refined_srt": null,
   "chunks_completed": 3,
-  "total_chunks": 12
+  "total_chunks": 12,
+  "refined": null,
+  "queue_position": 0,
+  "started_at": "2025-01-15T10:29:55"
 }
 ```
 
@@ -302,7 +306,10 @@ Get status of an async transcription job.
   "aligned_srt": null,
   "refined_srt": null,
   "chunks_completed": 12,
-  "total_chunks": 12
+  "total_chunks": 12,
+  "refined": true,
+  "queue_position": null,
+  "started_at": "2025-01-15T10:29:55"
 }
 ```
 
@@ -320,7 +327,8 @@ Get status of an async transcription job.
     "error_code": "E2001",
     "error_type": "OutOfMemoryError",
     "message": "GPU memory exhausted during processing",
-    "details": {"memory_type": "GPU"}
+    "details": {"memory_type": "GPU"},
+    "http_status": 503
   },
   "alignment_log": null,
   "refinement_log": null,
@@ -329,7 +337,10 @@ Get status of an async transcription job.
   "aligned_srt": null,
   "refined_srt": null,
   "chunks_completed": 3,
-  "total_chunks": 12
+  "total_chunks": 12,
+  "refined": null,
+  "queue_position": null,
+  "started_at": "2025-01-15T10:29:55"
 }
 ```
 
@@ -400,6 +411,7 @@ Returns raw SRT text for the specified chunk.
 | `speakers` | `list[string]` | `[]` | List of speaker IDs |
 | `model_version` | `string` | `"vibevoice-asr"` | Model identifier |
 | `aligned` | `bool` | `true` | Whether Qwen alignment was applied |
+| `refined` | `bool` | `true` | Whether LLM refinement was applied |
 
 ### JobStatus (enum)
 
@@ -436,6 +448,9 @@ Returns raw SRT text for the specified chunk.
 | `refined_srt` | `string \| null` | Stage 3 output |
 | `chunks_completed` | `int` | Chunks processed |
 | `total_chunks` | `int` | Total chunks |
+| `refined` | `bool \| null` | Whether LLM refinement was applied (`null` while pending/processing) |
+| `queue_position` | `int \| null` | Queue position: `null`=completed/failed, `0`=processing, `1`+=waiting |
+| `started_at` | `datetime \| null` | When processing started |
 
 ### HealthResponse
 

@@ -688,6 +688,13 @@ class ChalnaPipeline:
         if not audio_path.exists():
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
+        # Reset per-request state (prevents stale data from previous runs)
+        self._raw_segments = None
+        self._aligned_segments = None
+        self._refined_segments = None
+        self._refinement_log = None
+        self._last_alignment_log = []
+
         def _progress(stage: str, value: float, **extra):
             if progress_callback:
                 progress_callback(stage, value, **extra)
@@ -807,6 +814,7 @@ class ChalnaPipeline:
             speakers=speakers,
             model_version="vibevoice-asr",
             aligned=self.use_alignment and self._aligner is not None,
+            refined=self.use_llm_refinement and self._refined_segments is not None,
         )
 
         # Build intermediate results (thread-safe, per-request)

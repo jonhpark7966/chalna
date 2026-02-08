@@ -294,7 +294,10 @@ class ChalnaPipeline:
                     chunk_segments = chunk_segments[:-1]
 
             # Determine next chunk start point
-            if chunk_segments:
+            if chunk_end >= total_duration:
+                # Last chunk — always terminate regardless of segment coverage
+                next_start = total_duration
+            elif chunk_segments:
                 next_start = chunk_segments[-1].end_time
             else:
                 next_start = chunk_end

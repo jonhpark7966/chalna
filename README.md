@@ -6,10 +6,11 @@ SRT 자막 생성 서비스. VibeVoice ASR + Qwen Forced Alignment를 결합하�
 
 ## Features
 
-- **VibeVoice ASR**: 60분 오디오 처리, 화자 분리 지원
+- **VibeVoice ASR**: 10시간 오디오 처리, 화자 분리 지원 (11분 이상은 10분 청크로 분할)
 - **Qwen Forced Alignment**: 단어 수준의 정확한 타임스탬프 보정
 - **LLM Refinement**: Codex CLI를 통한 자막 교정 및 긴 문장 분리
 - **다양한 출력 형식**: SRT, JSON
+- **Web UI**: FastAPI 내장 Web UI (별도 설치 불필요)
 - **CLI & REST API**: 로컬 사용 및 서비스 배포 지원
 
 ## Installation
@@ -28,11 +29,11 @@ pip install -e external/VibeVoice
 
 ### LLM Refinement 설정 (Optional)
 
-LLM refinement 기능을 사용하려면 [Codex CLI](https://github.com/openai/codex)가 필요합니다.
+LLM refinement 기능을 사용하려면 [Codex CLI](https://github.com/anthropics/codex)가 필요합니다.
 
 ```bash
 # Codex CLI 설치
-npm install -g @openai/codex
+npm install -g @anthropic-ai/codex
 
 # venv 환경에서 실행 시 symlink 필요
 # (venv의 PATH에 npm global bin이 포함되지 않음)
@@ -65,16 +66,28 @@ chalna transcribe audio.mp3 -o output.srt --no-align
 chalna transcribe audio.mp3 -o output.json --json
 ```
 
-### REST API
+### REST API / Web UI
 
 ```bash
-# Start server
-chalna serve --host 0.0.0.0 --port 8000
+# Start server (API + Web UI)
+chalna serve
+
+# Web UI: http://localhost:7861/
+# API Docs: http://localhost:7861/docs
 
 # Transcribe (curl)
-curl -X POST http://localhost:8000/transcribe \
+curl -X POST http://localhost:7861/transcribe \
   -F "file=@audio.mp3" \
   -F "output_format=srt"
+
+# Async transcription (긴 파일용)
+curl -X POST http://localhost:7861/transcribe/async \
+  -F "file=@long_audio.mp3" \
+  -F "output_format=srt"
+# → {"job_id": "...", "status": "queued", "estimated_completion": "..."}
+
+# Job 상태 폴링
+curl http://localhost:7861/jobs/{job_id}
 ```
 
 ### Python
@@ -99,10 +112,13 @@ for seg in result.segments:
 
 | Method | Path | Description |
 |--------|------|-------------|
+| GET | `/` | Web UI |
+| GET | `/health` | 서버 상태 확인 |
+| POST | `/unload` | GPU 모델 언로드 |
 | POST | `/transcribe` | 동기 자막 생성 |
 | POST | `/transcribe/async` | 비동기 자막 생성 (긴 파일용) |
 | GET | `/jobs/{job_id}` | 비동기 작업 상태 조회 |
-| GET | `/health` | 서버 상태 확인 |
+| GET | `/jobs/{job_id}/chunks/{index}` | 청크별 ASR 원본 조회 |
 
 ### Transcription Parameters
 

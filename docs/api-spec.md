@@ -42,6 +42,22 @@ All `ChalnaError` exceptions are returned as structured JSON:
 
 ## 3. Endpoints
 
+### 3.0 `GET /`
+
+Serve the built-in Web UI (single-page app).
+
+**Request**
+
+No parameters.
+
+**Response `200`**
+
+Content-Type: `text/html; charset=utf-8`
+
+Returns the Web UI HTML page. If the static file is missing, returns a fallback page with a link to `/docs`.
+
+---
+
 ### 3.1 `GET /health`
 
 Check server health and model status.

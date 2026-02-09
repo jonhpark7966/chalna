@@ -1,0 +1,708 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>찰나 (Chalna) — SRT 자막 생성</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg: #1a1a2e;
+  --card: #16213e;
+  --accent: #0f3460;
+  --accent-bright: #1a5276;
+  --text: #e0e0e0;
+  --text-dim: #8899aa;
+  --success: #27ae60;
+  --error: #e74c3c;
+  --warning: #f39c12;
+  --border: #2a3a5e;
+  --radius: 8px;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  line-height: 1.5;
+}
+
+header {
+  background: var(--card);
+  border-bottom: 1px solid var(--border);
+  padding: 16px 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+header h1 {
+  font-size: 1.25rem;
+  font-weight: 600;
+}
+
+header h1 span { color: var(--text-dim); font-weight: 400; font-size: 0.9rem; }
+
+header a {
+  color: var(--text-dim);
+  text-decoration: none;
+  font-size: 0.85rem;
+}
+header a:hover { color: var(--text); }
+
+.container {
+  display: grid;
+  grid-template-columns: 340px 1fr;
+  gap: 20px;
+  max-width: 1200px;
+  margin: 24px auto;
+  padding: 0 24px;
+}
+
+@media (max-width: 768px) {
+  .container { grid-template-columns: 1fr; }
+}
+
+/* --- Left Panel --- */
+.panel {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px;
+}
+
+.panel h2 {
+  font-size: 0.95rem;
+  font-weight: 600;
+  margin-bottom: 16px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+/* Drop zone */
+.drop-zone {
+  border: 2px dashed var(--border);
+  border-radius: var(--radius);
+  padding: 32px 16px;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color 0.2s, background 0.2s;
+  margin-bottom: 16px;
+}
+
+.drop-zone:hover, .drop-zone.dragover {
+  border-color: var(--accent-bright);
+  background: rgba(15, 52, 96, 0.2);
+}
+
+.drop-zone.has-file {
+  border-color: var(--success);
+  border-style: solid;
+}
+
+.drop-zone p { color: var(--text-dim); font-size: 0.9rem; }
+.drop-zone .file-name { color: var(--text); font-weight: 500; margin-top: 4px; }
+.drop-zone .file-size { color: var(--text-dim); font-size: 0.8rem; }
+.drop-zone input { display: none; }
+
+/* Form fields */
+label.field {
+  display: block;
+  margin-bottom: 14px;
+}
+
+label.field .label-text {
+  display: block;
+  font-size: 0.85rem;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+
+textarea, input[type="text"] {
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  padding: 8px 12px;
+  font-size: 0.9rem;
+  font-family: inherit;
+  resize: vertical;
+}
+
+textarea:focus, input[type="text"]:focus {
+  outline: none;
+  border-color: var(--accent-bright);
+}
+
+.checkbox-group { margin-bottom: 16px; }
+
+.checkbox-group label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.9rem;
+  cursor: pointer;
+  margin-bottom: 6px;
+}
+
+.checkbox-group input[type="checkbox"] {
+  accent-color: var(--accent-bright);
+  width: 16px;
+  height: 16px;
+}
+
+button.submit {
+  width: 100%;
+  padding: 12px;
+  background: var(--accent);
+  border: 1px solid var(--accent-bright);
+  border-radius: var(--radius);
+  color: var(--text);
+  font-size: 1rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+button.submit:hover:not(:disabled) { background: var(--accent-bright); }
+button.submit:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* --- Right Panel --- */
+.status-idle { color: var(--text-dim); text-align: center; padding: 48px 16px; font-size: 0.95rem; }
+
+/* Progress */
+.progress-section { margin-bottom: 20px; }
+.progress-section .stage { font-size: 1rem; font-weight: 500; margin-bottom: 8px; }
+.progress-section .meta { font-size: 0.85rem; color: var(--text-dim); margin-bottom: 4px; }
+
+.progress-bar-bg {
+  width: 100%;
+  height: 8px;
+  background: var(--bg);
+  border-radius: 4px;
+  overflow: hidden;
+  margin: 10px 0;
+}
+
+.progress-bar-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #0f3460, #1a5276);
+  border-radius: 4px;
+  transition: width 0.5s ease;
+  width: 0%;
+}
+
+/* Result */
+.result-section h3 {
+  font-size: 0.95rem;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+.result-badge {
+  display: inline-block;
+  font-size: 0.75rem;
+  padding: 2px 8px;
+  border-radius: 4px;
+  margin-left: 8px;
+  font-weight: 500;
+}
+
+.badge-refined { background: var(--success); color: #fff; }
+.badge-unrefined { background: var(--warning); color: #1a1a2e; }
+
+.srt-output {
+  width: 100%;
+  min-height: 240px;
+  max-height: 480px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+  font-size: 0.85rem;
+  padding: 12px;
+  resize: vertical;
+  line-height: 1.6;
+}
+
+button.download {
+  display: inline-block;
+  margin-top: 10px;
+  padding: 8px 20px;
+  background: var(--success);
+  border: none;
+  border-radius: var(--radius);
+  color: #fff;
+  font-size: 0.9rem;
+  font-weight: 500;
+  cursor: pointer;
+  text-decoration: none;
+}
+
+button.download:hover { opacity: 0.9; }
+
+/* Intermediate collapsible */
+details {
+  margin-top: 20px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+details summary {
+  padding: 10px 14px;
+  background: var(--accent);
+  cursor: pointer;
+  font-size: 0.9rem;
+  font-weight: 500;
+  user-select: none;
+}
+
+details summary:hover { background: var(--accent-bright); }
+
+.intermediate-content {
+  padding: 14px;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.intermediate-content button {
+  padding: 6px 14px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.intermediate-content button:hover { background: var(--accent); }
+
+/* Error */
+.error-box {
+  background: rgba(231, 76, 60, 0.1);
+  border: 1px solid var(--error);
+  border-radius: var(--radius);
+  padding: 16px;
+  color: var(--error);
+}
+
+.error-box .error-title { font-weight: 600; margin-bottom: 4px; }
+.error-box .error-msg { font-size: 0.9rem; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>찰나 (Chalna) <span>— SRT 자막 생성</span></h1>
+  <a href="/docs">API Docs</a>
+</header>
+
+<div class="container">
+  <!-- Left: Input Panel -->
+  <div class="panel" id="input-panel">
+    <h2>입력</h2>
+
+    <div class="drop-zone" id="drop-zone">
+      <p>파일을 드래그하거나 클릭하여 업로드</p>
+      <p style="font-size:0.8rem; margin-top:4px; color:var(--text-dim)">mp3, wav, m4a, flac, ogg, mp4, mov, webm, mkv, avi</p>
+      <input type="file" id="file-input" accept=".mp3,.wav,.m4a,.flac,.ogg,.mp4,.mov,.webm,.mkv,.avi">
+    </div>
+
+    <label class="field">
+      <span class="label-text">컨텍스트 (선택)</span>
+      <textarea id="context-input" rows="2" placeholder="예: 참석자: 철수, 영희"></textarea>
+    </label>
+
+    <div class="checkbox-group">
+      <label><input type="checkbox" id="opt-alignment" checked> 타임스탬프 정렬</label>
+      <label><input type="checkbox" id="opt-refinement" checked> LLM 자막 교정</label>
+    </div>
+
+    <button class="submit" id="btn-submit" disabled>변환</button>
+  </div>
+
+  <!-- Right: Status / Result Panel -->
+  <div class="panel" id="result-panel">
+    <div id="view-idle" class="status-idle">
+      파일을 업로드하고 변환을 시작하세요.
+    </div>
+
+    <div id="view-progress" style="display:none">
+      <div class="progress-section">
+        <div class="stage" id="progress-stage">준비 중...</div>
+        <div class="progress-bar-bg"><div class="progress-bar-fill" id="progress-bar"></div></div>
+        <div class="meta" id="progress-percent"></div>
+        <div class="meta" id="progress-queue"></div>
+        <div class="meta" id="progress-chunks"></div>
+        <div class="meta" id="progress-eta"></div>
+      </div>
+    </div>
+
+    <div id="view-result" style="display:none">
+      <div class="result-section">
+        <h3>결과 <span id="result-badge"></span></h3>
+        <div class="meta" id="result-duration" style="margin-bottom:10px"></div>
+        <textarea class="srt-output" id="srt-output" readonly></textarea>
+        <br>
+        <button class="download" id="btn-download">SRT 다운로드</button>
+      </div>
+
+      <details id="intermediate-section" style="display:none">
+        <summary>중간 결과물</summary>
+        <div class="intermediate-content" id="intermediate-buttons"></div>
+      </details>
+    </div>
+
+    <div id="view-error" style="display:none">
+      <div class="error-box">
+        <div class="error-title" id="error-title">오류</div>
+        <div class="error-msg" id="error-msg"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function() {
+  'use strict';
+
+  // --- Stage name mapping ---
+  const STAGE_NAMES = {
+    'queued': '대기 중',
+    'loading_models': '모델 로딩 중',
+    'transcribing': '자막 생성 중 (VibeVoice)',
+    'aligning': '타임스탬프 정렬 중 (Qwen)',
+    'refining': '자막 교정 중 (LLM)',
+    'saving': '결과 저장 중',
+  };
+
+  // --- DOM refs ---
+  const dropZone = document.getElementById('drop-zone');
+  const fileInput = document.getElementById('file-input');
+  const contextInput = document.getElementById('context-input');
+  const optAlignment = document.getElementById('opt-alignment');
+  const optRefinement = document.getElementById('opt-refinement');
+  const btnSubmit = document.getElementById('btn-submit');
+
+  const viewIdle = document.getElementById('view-idle');
+  const viewProgress = document.getElementById('view-progress');
+  const viewResult = document.getElementById('view-result');
+  const viewError = document.getElementById('view-error');
+
+  const progressStage = document.getElementById('progress-stage');
+  const progressBar = document.getElementById('progress-bar');
+  const progressPercent = document.getElementById('progress-percent');
+  const progressQueue = document.getElementById('progress-queue');
+  const progressChunks = document.getElementById('progress-chunks');
+  const progressEta = document.getElementById('progress-eta');
+
+  const srtOutput = document.getElementById('srt-output');
+  const btnDownload = document.getElementById('btn-download');
+  const resultBadge = document.getElementById('result-badge');
+  const resultDuration = document.getElementById('result-duration');
+  const intermediateSection = document.getElementById('intermediate-section');
+  const intermediateButtons = document.getElementById('intermediate-buttons');
+
+  const errorTitle = document.getElementById('error-title');
+  const errorMsg = document.getElementById('error-msg');
+
+  let selectedFile = null;
+  let pollTimer = null;
+  let jobStartTime = null;
+
+  // --- File selection ---
+  dropZone.addEventListener('click', () => fileInput.click());
+
+  dropZone.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    dropZone.classList.add('dragover');
+  });
+
+  dropZone.addEventListener('dragleave', () => {
+    dropZone.classList.remove('dragover');
+  });
+
+  dropZone.addEventListener('drop', (e) => {
+    e.preventDefault();
+    dropZone.classList.remove('dragover');
+    if (e.dataTransfer.files.length > 0) {
+      selectFile(e.dataTransfer.files[0]);
+    }
+  });
+
+  fileInput.addEventListener('change', () => {
+    if (fileInput.files.length > 0) {
+      selectFile(fileInput.files[0]);
+    }
+  });
+
+  function selectFile(file) {
+    selectedFile = file;
+    dropZone.classList.add('has-file');
+    const sizeMB = (file.size / (1024 * 1024)).toFixed(1);
+    dropZone.innerHTML = `
+      <p class="file-name">${escapeHtml(file.name)}</p>
+      <p class="file-size">${sizeMB} MB</p>
+      <input type="file" id="file-input" accept=".mp3,.wav,.m4a,.flac,.ogg,.mp4,.mov,.webm,.mkv,.avi">
+    `;
+    // Re-bind hidden input
+    const newInput = dropZone.querySelector('input');
+    newInput.addEventListener('change', () => {
+      if (newInput.files.length > 0) selectFile(newInput.files[0]);
+    });
+    btnSubmit.disabled = false;
+  }
+
+  // --- Submit ---
+  btnSubmit.addEventListener('click', async () => {
+    if (!selectedFile) return;
+
+    // Build FormData
+    const fd = new FormData();
+    fd.append('file', selectedFile);
+    if (contextInput.value.trim()) {
+      fd.append('context', contextInput.value.trim());
+    }
+    fd.append('include_speaker', 'true');
+    fd.append('use_alignment', optAlignment.checked ? 'true' : 'false');
+    fd.append('use_llm_refinement', optRefinement.checked ? 'true' : 'false');
+    fd.append('output_format', 'srt');
+    fd.append('include_intermediate', 'true');
+
+    // UI: show progress
+    showView('progress');
+    btnSubmit.disabled = true;
+    progressStage.textContent = '업로드 중...';
+    progressBar.style.width = '0%';
+    progressPercent.textContent = '';
+    progressQueue.textContent = '';
+    progressChunks.textContent = '';
+    progressEta.textContent = '';
+    jobStartTime = Date.now();
+
+    try {
+      const res = await fetch('/transcribe/async', { method: 'POST', body: fd });
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.message || errData.detail || `HTTP ${res.status}`);
+      }
+
+      const data = await res.json();
+      const jobId = data.job_id;
+
+      // Show initial ETA
+      if (data.estimated_processing_seconds) {
+        progressEta.textContent = `예상 처리 시간: ${formatDuration(data.estimated_processing_seconds)}`;
+      }
+      if (data.estimated_wait_seconds > 0) {
+        progressQueue.textContent = `예상 대기: ${formatDuration(data.estimated_wait_seconds)}`;
+      }
+
+      // Start polling
+      startPolling(jobId);
+    } catch (err) {
+      showError('요청 실패', err.message);
+      btnSubmit.disabled = false;
+    }
+  });
+
+  // --- Polling ---
+  function startPolling(jobId) {
+    if (pollTimer) clearInterval(pollTimer);
+    pollTimer = setInterval(() => pollJob(jobId), 2000);
+    // Immediate first poll
+    pollJob(jobId);
+  }
+
+  async function pollJob(jobId) {
+    try {
+      const res = await fetch(`/jobs/${jobId}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const job = await res.json();
+      updateProgress(job);
+    } catch (err) {
+      // Network error — keep polling, don't stop
+      console.error('Poll error:', err);
+    }
+  }
+
+  function updateProgress(job) {
+    if (job.status === 'queued') {
+      progressStage.textContent = STAGE_NAMES['queued'];
+      progressBar.style.width = '0%';
+      progressPercent.textContent = '';
+      if (job.queue_position != null && job.queue_position > 0) {
+        progressQueue.textContent = `큐 위치: #${job.queue_position}`;
+      }
+      if (job.estimated_wait_seconds > 0) {
+        progressEta.textContent = `예상 대기: ${formatDuration(job.estimated_wait_seconds)}`;
+      }
+      if (job.estimated_completion) {
+        const completionTime = new Date(job.estimated_completion).toLocaleTimeString('ko-KR');
+        progressEta.textContent += ` / 예상 완료: ${completionTime}`;
+      }
+      return;
+    }
+
+    if (job.status === 'processing') {
+      // Determine current stage from progress_history
+      let currentStage = 'processing';
+      if (job.progress_history && job.progress_history.length > 0) {
+        const last = job.progress_history[job.progress_history.length - 1];
+        currentStage = last.stage || 'processing';
+      }
+
+      progressStage.textContent = STAGE_NAMES[currentStage] || currentStage;
+      const pct = Math.round(job.progress * 100);
+      progressBar.style.width = pct + '%';
+      progressPercent.textContent = `${pct}%`;
+      progressQueue.textContent = '';
+
+      // Chunks
+      if (job.total_chunks > 0) {
+        progressChunks.textContent = `${job.chunks_completed}/${job.total_chunks} 청크 완료`;
+      } else {
+        progressChunks.textContent = '';
+      }
+
+      // ETA
+      if (job.estimated_completion) {
+        const remaining = (new Date(job.estimated_completion) - Date.now()) / 1000;
+        if (remaining > 0) {
+          progressEta.textContent = `남은 시간: ${formatDuration(remaining)}`;
+        } else {
+          progressEta.textContent = '거의 완료...';
+        }
+      } else if (job.estimated_processing_seconds) {
+        progressEta.textContent = `남은 시간: ${formatDuration(job.estimated_processing_seconds)}`;
+      }
+      return;
+    }
+
+    // Terminal states — stop polling
+    stopPolling();
+
+    if (job.status === 'completed') {
+      showResult(job);
+      return;
+    }
+
+    if (job.status === 'failed') {
+      const code = job.error_details?.error_code || '';
+      const title = code ? `오류 [${code}]` : '오류';
+      showError(title, job.error || '알 수 없는 오류');
+      btnSubmit.disabled = false;
+      return;
+    }
+  }
+
+  function stopPolling() {
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+  }
+
+  // --- Show result ---
+  function showResult(job) {
+    showView('result');
+    btnSubmit.disabled = false;
+
+    srtOutput.value = job.result || '';
+
+    // Badge
+    if (job.refined === true) {
+      resultBadge.innerHTML = '<span class="result-badge badge-refined">LLM 교정됨</span>';
+    } else if (job.refined === false) {
+      resultBadge.innerHTML = '<span class="result-badge badge-unrefined">교정 안됨</span>';
+    } else {
+      resultBadge.innerHTML = '';
+    }
+
+    // Duration
+    const elapsed = ((Date.now() - jobStartTime) / 1000);
+    resultDuration.textContent = `소요 시간: ${formatDuration(elapsed)}`;
+
+    // Download
+    btnDownload.onclick = () => downloadSrt(job.result || '', 'output.srt');
+
+    // Intermediate results
+    const hasIntermediate = job.raw_srt || job.aligned_srt || job.refined_srt;
+    if (hasIntermediate) {
+      intermediateSection.style.display = '';
+      intermediateButtons.innerHTML = '';
+
+      if (job.raw_srt) {
+        intermediateButtons.appendChild(makeDownloadBtn('Raw (VibeVoice)', job.raw_srt, 'raw.srt'));
+      }
+      if (job.aligned_srt) {
+        intermediateButtons.appendChild(makeDownloadBtn('Aligned (Qwen)', job.aligned_srt, 'aligned.srt'));
+      }
+      if (job.refined_srt) {
+        intermediateButtons.appendChild(makeDownloadBtn('Refined (LLM)', job.refined_srt, 'refined.srt'));
+      }
+    } else {
+      intermediateSection.style.display = 'none';
+    }
+  }
+
+  // --- Helpers ---
+  function showView(name) {
+    viewIdle.style.display = name === 'idle' ? '' : 'none';
+    viewProgress.style.display = name === 'progress' ? '' : 'none';
+    viewResult.style.display = name === 'result' ? '' : 'none';
+    viewError.style.display = name === 'error' ? '' : 'none';
+  }
+
+  function showError(title, msg) {
+    showView('error');
+    errorTitle.textContent = title;
+    errorMsg.textContent = msg;
+  }
+
+  function formatDuration(secs) {
+    secs = Math.round(secs);
+    if (secs < 60) return `${secs}초`;
+    const m = Math.floor(secs / 60);
+    const s = secs % 60;
+    if (m < 60) return s > 0 ? `${m}분 ${s}초` : `${m}분`;
+    const h = Math.floor(m / 60);
+    const rm = m % 60;
+    return `${h}시간 ${rm}분`;
+  }
+
+  function downloadSrt(content, filename) {
+    const blob = new Blob([content], { type: 'text/plain; charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  function makeDownloadBtn(label, content, filename) {
+    const btn = document.createElement('button');
+    btn.textContent = label;
+    btn.addEventListener('click', () => downloadSrt(content, filename));
+    return btn;
+  }
+
+  function escapeHtml(str) {
+    const div = document.createElement('div');
+    div.textContent = str;
+    return div.innerHTML;
+  }
+})();
+</script>
+</body>
+</html>

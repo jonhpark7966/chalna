@@ -20,7 +20,7 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 RESULTS_DIR = Path(os.environ.get("CHALNA_RESULTS_DIR", "/home/jonhpark/workspace/chalna/results"))
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse, JSONResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from chalna import __version__
@@ -45,6 +45,21 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# =============================================================================
+# Static Files (Web UI)
+# =============================================================================
+
+_STATIC_DIR = Path(__file__).parent / "static"
+
+
+@app.get("/", response_class=HTMLResponse)
+async def web_ui():
+    """Serve the built-in Web UI."""
+    index_path = _STATIC_DIR / "index.html"
+    if index_path.exists():
+        return index_path.read_text(encoding="utf-8")
+    return HTMLResponse("<h1>Chalna API</h1><p><a href='/docs'>API Docs</a></p>")
 
 
 # =============================================================================

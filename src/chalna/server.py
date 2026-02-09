@@ -9,7 +9,7 @@ import json
 import os
 import tempfile
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta as _timedelta
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
@@ -73,6 +73,16 @@ _queue_worker_task: Optional[asyncio.Task] = None
 _job_events: Dict[str, asyncio.Event] = {}  # sync endpoint wait
 _job_params: Dict[str, Dict[str, Any]] = {}  # queued job parameters
 
+# Performance stats for ETA estimation (seconds of processing per second of audio)
+# Updated with exponential moving average as jobs complete
+_performance_stats: Dict[str, float] = {
+    "asr_rate": 0.133,       # ~8s per min of audio
+    "align_rate": 0.017,     # ~1s per min of audio
+    "refine_rate": 0.067,    # ~4s per min of audio (with parallel refinement)
+    "overhead": 10.0,        # flat overhead (model load, validation, formatting)
+    "completed_count": 0,
+}
+
 
 def get_pipeline():
     """Get or create pipeline instance."""
@@ -111,6 +121,139 @@ def _compute_queue_position(job_id: str) -> Optional[int]:
     return position
 
 
+def _estimate_job_duration(job: "Job") -> float:
+    """Estimate total processing time for a job in seconds."""
+    if job.audio_duration is None:
+        return 60.0  # fallback
+
+    duration = job.audio_duration
+    rate = _performance_stats["asr_rate"]
+    if job.use_alignment:
+        rate += _performance_stats["align_rate"]
+    if job.use_llm_refinement:
+        rate += _performance_stats["refine_rate"]
+
+    return duration * rate + _performance_stats["overhead"]
+
+
+def _estimate_remaining(job: "Job") -> float:
+    """Estimate remaining processing time for a job that's already running."""
+    estimated_total = _estimate_job_duration(job)
+
+    if job.status == JobStatus.PROCESSING and job.started_at:
+        elapsed = (datetime.utcnow() - job.started_at).total_seconds()
+        return max(0.0, estimated_total - elapsed)
+
+    if job.status in (JobStatus.COMPLETED, JobStatus.FAILED):
+        return 0.0
+
+    return estimated_total
+
+
+def _compute_eta(job_id: str) -> Dict[str, Any]:
+    """Compute ETA for a job including queue wait time.
+
+    Returns dict with:
+        wait_seconds: time until job starts processing
+        processing_seconds: estimated processing time
+        completion: estimated completion datetime
+    """
+    job = _jobs.get(job_id)
+    if job is None:
+        return {}
+
+    if job.status in (JobStatus.COMPLETED, JobStatus.FAILED):
+        return {}
+
+    processing_seconds = _estimate_job_duration(job)
+
+    if job.status == JobStatus.PROCESSING:
+        remaining = _estimate_remaining(job)
+        return {
+            "wait_seconds": 0.0,
+            "processing_seconds": remaining,
+            "completion": datetime.utcnow() + _timedelta(seconds=remaining),
+        }
+
+    # QUEUED: sum up remaining time for all jobs ahead
+    wait = 0.0
+    for other in _jobs.values():
+        if other.job_id == job_id:
+            continue
+        if other.status == JobStatus.PROCESSING:
+            wait += _estimate_remaining(other)
+        elif other.status == JobStatus.QUEUED and other.created_at < job.created_at:
+            wait += _estimate_job_duration(other)
+
+    completion = datetime.utcnow() + _timedelta(seconds=wait + processing_seconds)
+
+    return {
+        "wait_seconds": round(wait, 1),
+        "processing_seconds": round(processing_seconds, 1),
+        "completion": completion,
+    }
+
+
+def _update_performance_stats(job: "Job") -> None:
+    """Update rolling average performance stats when a job completes."""
+    if job.audio_duration is None or job.audio_duration <= 0:
+        return
+    if not job.started_at or not job.completed_at:
+        return
+
+    # Parse stage durations from progress_history
+    stage_times: Dict[str, List[str]] = {}
+    for entry in job.progress_history:
+        stage = entry.get("stage", "")
+        ts = entry.get("timestamp", "")
+        if stage and ts:
+            stage_times.setdefault(stage, []).append(ts)
+
+    def _ts_range(timestamps: List[str]) -> float:
+        if len(timestamps) < 2:
+            return 0.0
+        for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                t0 = datetime.strptime(timestamps[0], fmt).timestamp()
+                t1 = datetime.strptime(timestamps[-1], fmt).timestamp()
+                return max(0.0, t1 - t0)
+            except ValueError:
+                continue
+        return 0.0
+
+    dur = job.audio_duration
+    total_elapsed = (job.completed_at - job.started_at).total_seconds()
+
+    asr_time = _ts_range(stage_times.get("transcribing", []))
+    align_time = _ts_range(stage_times.get("aligning", []))
+    refine_time = _ts_range(stage_times.get("refining", []))
+    overhead = max(0.0, total_elapsed - asr_time - align_time - refine_time)
+
+    # Exponential moving average (alpha=0.3 gives recent data more weight)
+    alpha = 0.3
+    n = _performance_stats["completed_count"]
+
+    if n == 0:
+        # First job: replace defaults entirely
+        alpha = 1.0
+
+    _performance_stats["asr_rate"] = (
+        alpha * (asr_time / dur) + (1 - alpha) * _performance_stats["asr_rate"]
+    )
+    if job.use_alignment and align_time > 0:
+        _performance_stats["align_rate"] = (
+            alpha * (align_time / dur) + (1 - alpha) * _performance_stats["align_rate"]
+        )
+    if job.use_llm_refinement and refine_time > 0:
+        _performance_stats["refine_rate"] = (
+            alpha * (refine_time / dur) + (1 - alpha) * _performance_stats["refine_rate"]
+        )
+    _performance_stats["overhead"] = (
+        alpha * overhead + (1 - alpha) * _performance_stats["overhead"]
+    )
+    _performance_stats["completed_count"] = n + 1
+
+
 # =============================================================================
 # Models
 # =============================================================================
@@ -146,6 +289,10 @@ class Job(BaseModel):
     chunk_raw_srts: Dict[int, str] = Field(default_factory=dict)
     # Refinement status
     refined: Optional[bool] = None
+    # ETA estimation
+    audio_duration: Optional[float] = None  # seconds
+    use_alignment: bool = True
+    use_llm_refinement: bool = True
 
 
 class ErrorResponse(BaseModel):
@@ -166,7 +313,9 @@ class TranscriptionProgress(BaseModel):
 class TranscribeResponse(BaseModel):
     job_id: str
     status: JobStatus
-    estimated_time: Optional[int] = None  # seconds
+    estimated_wait_seconds: Optional[float] = None
+    estimated_processing_seconds: Optional[float] = None
+    estimated_completion: Optional[datetime] = None
 
 
 class JobResponse(BaseModel):
@@ -191,6 +340,10 @@ class JobResponse(BaseModel):
     # Queue info
     queue_position: Optional[int] = None
     started_at: Optional[datetime] = None
+    # ETA estimation
+    estimated_wait_seconds: Optional[float] = None
+    estimated_processing_seconds: Optional[float] = None
+    estimated_completion: Optional[datetime] = None
 
 
 class HealthResponse(BaseModel):
@@ -325,7 +478,7 @@ async def transcribe(
 
     # Validate audio file upfront (fail fast before queuing)
     try:
-        validate_audio_file(tmp_path)
+        audio_info = validate_audio_file(tmp_path)
     except ChalnaError:
         tmp_path.unlink(missing_ok=True)
         raise
@@ -337,6 +490,9 @@ async def transcribe(
         status=JobStatus.QUEUED,
         created_at=datetime.utcnow(),
         output_format=output_format,
+        audio_duration=audio_info.duration_seconds,
+        use_alignment=use_alignment,
+        use_llm_refinement=use_llm_refinement,
     )
     _jobs[job_id] = job
 
@@ -413,7 +569,7 @@ async def transcribe_async(
 
     # Validate audio file upfront (fail fast)
     try:
-        validate_audio_file(tmp_path)
+        audio_info = validate_audio_file(tmp_path)
     except ChalnaError:
         # Cleanup and re-raise for exception handler
         tmp_path.unlink(missing_ok=True)
@@ -426,6 +582,9 @@ async def transcribe_async(
         status=JobStatus.QUEUED,
         created_at=datetime.utcnow(),
         output_format=output_format,
+        audio_duration=audio_info.duration_seconds,
+        use_alignment=use_alignment,
+        use_llm_refinement=use_llm_refinement,
     )
     _jobs[job_id] = job
 
@@ -443,14 +602,15 @@ async def transcribe_async(
     )
     await _job_queue.put(job_id)
 
-    # Estimate time (rough: 1 min audio = 10 sec processing)
-    file_size_mb = len(content) / (1024 * 1024)
-    estimated_time = int(file_size_mb * 20)  # rough estimate
+    # Compute ETA
+    eta = _compute_eta(job_id)
 
     return TranscribeResponse(
         job_id=job_id,
         status=JobStatus.QUEUED,
-        estimated_time=estimated_time,
+        estimated_wait_seconds=eta.get("wait_seconds"),
+        estimated_processing_seconds=eta.get("processing_seconds"),
+        estimated_completion=eta.get("completion"),
     )
 
 
@@ -463,6 +623,7 @@ async def get_job(job_id: str):
         raise HTTPException(status_code=404, detail="Job not found")
 
     job = _jobs[job_id]
+    eta = _compute_eta(job_id)
     return JobResponse(
         job_id=job.job_id,
         status=job.status,
@@ -481,6 +642,9 @@ async def get_job(job_id: str):
         refined=job.refined,
         queue_position=_compute_queue_position(job_id),
         started_at=job.started_at,
+        estimated_wait_seconds=eta.get("wait_seconds"),
+        estimated_processing_seconds=eta.get("processing_seconds"),
+        estimated_completion=eta.get("completion"),
     )
 
 
@@ -658,6 +822,9 @@ async def _process_job(
         job.status = JobStatus.COMPLETED
         job.progress = 1.0
         job.completed_at = datetime.utcnow()
+
+        # Update performance stats for future ETA estimates
+        _update_performance_stats(job)
 
         # Save results to files
         _save_job_results(job, result, include_speaker)

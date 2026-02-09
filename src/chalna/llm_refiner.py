@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -272,19 +273,157 @@ def parse_refinement_response(
         ], parse_error
 
 
+def _process_single_chunk(
+    segments: List[Segment],
+    context: Optional[str],
+    chunk_idx: int,
+    chunk_size: int,
+) -> Tuple[int, List[Segment], Optional[List[RefinementResult]], Optional[str], Optional[Exception]]:
+    """
+    Process a single chunk through LLM refinement.
+
+    Thread-safe: only reads shared data, subprocess is independent.
+
+    Returns:
+        (chunk_idx, chunk_segments, results, parse_error, exception)
+    """
+    start_idx = chunk_idx * chunk_size
+    end_idx = min(start_idx + chunk_size, len(segments))
+    chunk_segments = segments[start_idx:end_idx]
+
+    try:
+        prompt = build_refinement_prompt(
+            segments=segments,
+            context=context,
+            chunk_start_idx=start_idx,
+            chunk_end_idx=end_idx,
+        )
+        response = call_codex_cli(prompt)
+        results, parse_error = parse_refinement_response(response, chunk_segments)
+        return chunk_idx, chunk_segments, results, parse_error, None
+    except (CodexAPIError, CodexRateLimitError) as e:
+        return chunk_idx, chunk_segments, None, None, e
+
+
+def _build_segments_from_chunk_result(
+    chunk_segments: List[Segment],
+    results: Optional[List[RefinementResult]],
+    parse_error: Optional[str],
+    error: Optional[Exception],
+    chunk_idx: int,
+    refined_segments: List[Segment],
+    refinement_log: List[dict],
+    origin_map: Dict[int, int],
+) -> None:
+    """Build refined segments from a single chunk's results. Mutates the output lists in-place."""
+    if error is not None:
+        # Error on this chunk — keep original segments
+        for seg in chunk_segments:
+            new_idx = len(refined_segments)
+            origin_map[new_idx] = seg.index
+            refined_segments.append(Segment(
+                index=new_idx + 1,
+                start_time=seg.start_time,
+                end_time=seg.end_time,
+                text=seg.text,
+                speaker_id=seg.speaker_id,
+                confidence=seg.confidence,
+            ))
+            refinement_log.append({
+                "original_index": seg.index,
+                "new_segment_index": new_idx,
+                "status": "error",
+                "error": str(error),
+                "text": seg.text,
+            })
+        return
+
+    for orig_seg, result in zip(chunk_segments, results):
+        if result.split_texts:
+            time_per_part = (orig_seg.end_time - orig_seg.start_time) / len(result.split_texts)
+            split_start_idx = len(refined_segments)
+
+            for i, text in enumerate(result.split_texts):
+                new_idx = len(refined_segments)
+                origin_map[new_idx] = orig_seg.index
+                refined_segments.append(Segment(
+                    index=new_idx + 1,
+                    start_time=orig_seg.start_time + i * time_per_part,
+                    end_time=orig_seg.start_time + (i + 1) * time_per_part,
+                    text=text,
+                    speaker_id=orig_seg.speaker_id,
+                    confidence=orig_seg.confidence * 0.9,
+                ))
+
+            refinement_log.append({
+                "original_index": orig_seg.index,
+                "status": "split",
+                "original_text": orig_seg.text,
+                "split_count": len(result.split_texts),
+                "split_texts": result.split_texts,
+                "new_segment_indices": list(range(split_start_idx, len(refined_segments))),
+                "original_start": orig_seg.start_time,
+                "original_end": orig_seg.end_time,
+            })
+        else:
+            new_idx = len(refined_segments)
+            origin_map[new_idx] = orig_seg.index
+            refined_segments.append(Segment(
+                index=new_idx + 1,
+                start_time=orig_seg.start_time,
+                end_time=orig_seg.end_time,
+                text=result.refined_text,
+                speaker_id=orig_seg.speaker_id,
+                confidence=orig_seg.confidence,
+            ))
+
+            log_entry = {
+                "original_index": orig_seg.index,
+                "new_segment_index": new_idx,
+            }
+
+            if result.parse_error:
+                log_entry["status"] = "parse_error"
+                log_entry["parse_error"] = result.parse_error
+                log_entry["text"] = orig_seg.text
+            elif result.refined_text != orig_seg.text:
+                log_entry["status"] = "refined"
+                log_entry["original_text"] = orig_seg.text
+                log_entry["refined_text"] = result.refined_text
+                log_entry["needs_realignment"] = result.needs_realignment
+            else:
+                log_entry["status"] = "unchanged"
+                log_entry["text"] = orig_seg.text
+
+            refinement_log.append(log_entry)
+
+    if parse_error:
+        refinement_log.append({
+            "chunk_idx": chunk_idx,
+            "status": "chunk_parse_warning",
+            "warning": parse_error,
+        })
+
+
 def refine_segments(
     segments: List[Segment],
     context: Optional[str] = None,
     chunk_size: int = 30,
+    max_workers: int = 5,
     progress_callback: Optional[Callable[[str, float], None]] = None,
 ) -> RefinementOutput:
     """
     Refine all segments using LLM.
 
+    Chunks are processed in parallel using ThreadPoolExecutor for speed.
+    The first chunk is processed synchronously to detect fatal errors
+    (e.g. Codex CLI not installed) before spawning threads.
+
     Args:
         segments: List of aligned segments
         context: Optional context/script for reference
         chunk_size: Number of segments per LLM call (~30 segments = 2-3min audio)
+        max_workers: Maximum concurrent Codex CLI calls (default: 5)
         progress_callback: Optional callback(stage, value) for progress
 
     Returns:
@@ -294,125 +433,55 @@ def refine_segments(
         CodexAPIError: If Codex CLI is not available (on first chunk)
         CodexRateLimitError: If rate limit exceeded (on first chunk)
     """
+    total_chunks = (len(segments) + chunk_size - 1) // chunk_size
+
+    if total_chunks == 0:
+        return RefinementOutput(segments=[], log=[], origin_map={})
+
+    if progress_callback:
+        progress_callback("refining", 0.0)
+
+    # Process first chunk synchronously to detect fatal errors (CLI not found, etc.)
+    first_result = _process_single_chunk(segments, context, 0, chunk_size)
+    _, _, _, _, first_error = first_result
+    if first_error is not None:
+        raise first_error
+
+    chunk_results = [first_result]
+    completed_count = 1
+
+    if progress_callback:
+        progress_callback("refining", completed_count / total_chunks)
+
+    # Process remaining chunks in parallel
+    if total_chunks > 1:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(
+                    _process_single_chunk, segments, context, chunk_idx, chunk_size
+                ): chunk_idx
+                for chunk_idx in range(1, total_chunks)
+            }
+            for future in as_completed(futures):
+                result = future.result()
+                chunk_results.append(result)
+                completed_count += 1
+                if progress_callback:
+                    progress_callback("refining", completed_count / total_chunks)
+
+    # Sort by chunk_idx to maintain segment order
+    chunk_results.sort(key=lambda x: x[0])
+
+    # Build refined_segments sequentially from collected results
     refined_segments: List[Segment] = []
     refinement_log: List[dict] = []
-    origin_map: Dict[int, int] = {}  # new_idx (0-based) -> original_index (1-based)
+    origin_map: Dict[int, int] = {}
 
-    total_chunks = (len(segments) + chunk_size - 1) // chunk_size
-    first_chunk_error: Optional[Exception] = None
-
-    for chunk_idx in range(total_chunks):
-        start_idx = chunk_idx * chunk_size
-        end_idx = min(start_idx + chunk_size, len(segments))
-        chunk_segments = segments[start_idx:end_idx]
-
-        if progress_callback:
-            progress_callback("refining", chunk_idx / total_chunks)
-
-        try:
-            prompt = build_refinement_prompt(
-                segments=segments,
-                context=context,
-                chunk_start_idx=start_idx,
-                chunk_end_idx=end_idx,
-            )
-
-            response = call_codex_cli(prompt)
-            results, parse_error = parse_refinement_response(response, chunk_segments)
-
-            for orig_seg, result in zip(chunk_segments, results):
-                if result.split_texts:
-                    # Segment needs splitting - create placeholder segments
-                    # Actual timestamps will be refined by re-alignment
-                    time_per_part = (orig_seg.end_time - orig_seg.start_time) / len(result.split_texts)
-                    split_start_idx = len(refined_segments)
-
-                    for i, text in enumerate(result.split_texts):
-                        new_idx = len(refined_segments)
-                        origin_map[new_idx] = orig_seg.index  # Track origin
-                        refined_segments.append(Segment(
-                            index=new_idx + 1,
-                            start_time=orig_seg.start_time + i * time_per_part,
-                            end_time=orig_seg.start_time + (i + 1) * time_per_part,
-                            text=text,
-                            speaker_id=orig_seg.speaker_id,
-                            confidence=orig_seg.confidence * 0.9,
-                        ))
-
-                    refinement_log.append({
-                        "original_index": orig_seg.index,
-                        "status": "split",
-                        "original_text": orig_seg.text,
-                        "split_count": len(result.split_texts),
-                        "split_texts": result.split_texts,
-                        "new_segment_indices": list(range(split_start_idx, len(refined_segments))),
-                        "original_start": orig_seg.start_time,
-                        "original_end": orig_seg.end_time,
-                    })
-                else:
-                    new_idx = len(refined_segments)
-                    origin_map[new_idx] = orig_seg.index  # Track origin
-                    refined_segments.append(Segment(
-                        index=new_idx + 1,
-                        start_time=orig_seg.start_time,
-                        end_time=orig_seg.end_time,
-                        text=result.refined_text,
-                        speaker_id=orig_seg.speaker_id,
-                        confidence=orig_seg.confidence,
-                    ))
-
-                    log_entry = {
-                        "original_index": orig_seg.index,
-                        "new_segment_index": new_idx,
-                    }
-
-                    if result.parse_error:
-                        log_entry["status"] = "parse_error"
-                        log_entry["parse_error"] = result.parse_error
-                        log_entry["text"] = orig_seg.text
-                    elif result.refined_text != orig_seg.text:
-                        log_entry["status"] = "refined"
-                        log_entry["original_text"] = orig_seg.text
-                        log_entry["refined_text"] = result.refined_text
-                        log_entry["needs_realignment"] = result.needs_realignment
-                    else:
-                        log_entry["status"] = "unchanged"
-                        log_entry["text"] = orig_seg.text
-
-                    refinement_log.append(log_entry)
-
-            # Log chunk-level parse error if any
-            if parse_error:
-                refinement_log.append({
-                    "chunk_idx": chunk_idx,
-                    "status": "chunk_parse_warning",
-                    "warning": parse_error,
-                })
-
-        except (CodexAPIError, CodexRateLimitError) as e:
-            # On first chunk, raise immediately (fatal error like CLI not found)
-            if chunk_idx == 0:
-                raise
-
-            # On subsequent chunks, log error and keep original segments
-            for seg in chunk_segments:
-                new_idx = len(refined_segments)
-                origin_map[new_idx] = seg.index
-                refined_segments.append(Segment(
-                    index=new_idx + 1,
-                    start_time=seg.start_time,
-                    end_time=seg.end_time,
-                    text=seg.text,
-                    speaker_id=seg.speaker_id,
-                    confidence=seg.confidence,
-                ))
-                refinement_log.append({
-                    "original_index": seg.index,
-                    "new_segment_index": new_idx,
-                    "status": "error",
-                    "error": str(e),
-                    "text": seg.text,
-                })
+    for chunk_idx, chunk_segments, results, parse_error, error in chunk_results:
+        _build_segments_from_chunk_result(
+            chunk_segments, results, parse_error, error, chunk_idx,
+            refined_segments, refinement_log, origin_map,
+        )
 
     if progress_callback:
         progress_callback("refining", 1.0)

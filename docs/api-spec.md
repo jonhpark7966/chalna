@@ -218,13 +218,17 @@ Same parameters as `POST /transcribe`.
 |-------|------|-------------|
 | `job_id` | `string` | UUID for the job |
 | `status` | `string` | `"queued"` |
-| `estimated_time` | `int \| null` | Rough estimate in seconds |
+| `estimated_wait_seconds` | `float \| null` | Seconds until processing starts (queue wait) |
+| `estimated_processing_seconds` | `float \| null` | Estimated processing time for this job |
+| `estimated_completion` | `datetime \| null` | Estimated completion time (ISO 8601) |
 
 ```json
 {
   "job_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
   "status": "queued",
-  "estimated_time": 60
+  "estimated_wait_seconds": 120.5,
+  "estimated_processing_seconds": 45.2,
+  "estimated_completion": "2026-02-09T15:30:45"
 }
 ```
 
@@ -285,7 +289,10 @@ Get status of an async transcription job.
   "total_chunks": 12,
   "refined": null,
   "queue_position": 0,
-  "started_at": "2025-01-15T10:29:55"
+  "started_at": "2025-01-15T10:29:55",
+  "estimated_wait_seconds": 0.0,
+  "estimated_processing_seconds": 85.3,
+  "estimated_completion": "2025-01-15T10:31:20"
 }
 ```
 
@@ -309,7 +316,10 @@ Get status of an async transcription job.
   "total_chunks": 12,
   "refined": true,
   "queue_position": null,
-  "started_at": "2025-01-15T10:29:55"
+  "started_at": "2025-01-15T10:29:55",
+  "estimated_wait_seconds": null,
+  "estimated_processing_seconds": null,
+  "estimated_completion": null
 }
 ```
 
@@ -340,7 +350,10 @@ Get status of an async transcription job.
   "total_chunks": 12,
   "refined": null,
   "queue_position": null,
-  "started_at": "2025-01-15T10:29:55"
+  "started_at": "2025-01-15T10:29:55",
+  "estimated_wait_seconds": null,
+  "estimated_processing_seconds": null,
+  "estimated_completion": null
 }
 ```
 
@@ -428,7 +441,9 @@ Returns raw SRT text for the specified chunk.
 |-------|------|-------------|
 | `job_id` | `string` | UUID |
 | `status` | `JobStatus` | Always `"queued"` on creation |
-| `estimated_time` | `int \| null` | Rough estimate in seconds |
+| `estimated_wait_seconds` | `float \| null` | Seconds until processing starts (queue wait) |
+| `estimated_processing_seconds` | `float \| null` | Estimated processing time for this job |
+| `estimated_completion` | `datetime \| null` | Estimated completion time (ISO 8601) |
 
 ### JobResponse
 
@@ -451,6 +466,9 @@ Returns raw SRT text for the specified chunk.
 | `refined` | `bool \| null` | Whether LLM refinement was applied (`null` while pending/processing) |
 | `queue_position` | `int \| null` | Queue position: `null`=completed/failed, `0`=processing, `1`+=waiting |
 | `started_at` | `datetime \| null` | When processing started |
+| `estimated_wait_seconds` | `float \| null` | Seconds until processing starts (`null` when completed/failed) |
+| `estimated_processing_seconds` | `float \| null` | Estimated remaining processing time (`null` when completed/failed) |
+| `estimated_completion` | `datetime \| null` | Estimated completion time (`null` when completed/failed) |
 
 ### HealthResponse
 

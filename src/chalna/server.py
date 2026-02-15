@@ -24,6 +24,7 @@ from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from chalna import __version__
+from chalna.db import init_db, save_job as db_save_job, list_jobs as db_list_jobs, get_job as db_get_job, count_jobs as db_count_jobs, migrate_from_results_dir
 from chalna.exceptions import ChalnaError
 from chalna.validation import validate_audio_file
 
@@ -355,6 +356,8 @@ class JobResponse(BaseModel):
     # Queue info
     queue_position: Optional[int] = None
     started_at: Optional[datetime] = None
+    # Audio info
+    audio_duration: Optional[float] = None
     # ETA estimation
     estimated_wait_seconds: Optional[float] = None
     estimated_processing_seconds: Optional[float] = None
@@ -629,37 +632,72 @@ async def transcribe_async(
     )
 
 
+@app.get("/jobs")
+async def list_jobs(
+    status: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+):
+    """List completed/failed jobs from DB (history)."""
+    jobs = db_list_jobs(status=status, limit=limit, offset=offset)
+    total = db_count_jobs(status=status)
+    return {"jobs": jobs, "total": total, "limit": limit, "offset": offset}
+
+
 @app.get("/jobs/{job_id}", response_model=JobResponse)
 async def get_job(job_id: str):
     """
     Get status of an async transcription job.
+
+    Checks in-memory jobs first (active), then falls back to DB (history).
     """
-    if job_id not in _jobs:
+    # Active in-memory job (queued/processing/just completed)
+    if job_id in _jobs:
+        job = _jobs[job_id]
+        eta = _compute_eta(job_id)
+        return JobResponse(
+            job_id=job.job_id,
+            status=job.status,
+            progress=job.progress,
+            result=job.result,
+            error=job.error,
+            error_details=job.error_details,
+            alignment_log=job.alignment_log,
+            refinement_log=job.refinement_log,
+            progress_history=job.progress_history,
+            raw_srt=job.raw_srt,
+            aligned_srt=job.aligned_srt,
+            refined_srt=job.refined_srt,
+            chunks_completed=job.chunks_completed,
+            total_chunks=job.total_chunks,
+            refined=job.refined,
+            queue_position=_compute_queue_position(job_id),
+            started_at=job.started_at,
+            audio_duration=job.audio_duration,
+            estimated_wait_seconds=eta.get("wait_seconds"),
+            estimated_processing_seconds=eta.get("processing_seconds"),
+            estimated_completion=eta.get("completion"),
+        )
+
+    # Fallback: DB historical job
+    db_job = db_get_job(job_id)
+    if db_job is None:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    job = _jobs[job_id]
-    eta = _compute_eta(job_id)
+    # Try to load SRT result from disk
+    result_srt = None
+    if db_job.get("has_result_files") and db_job.get("results_dir"):
+        result_srt = _load_srt_from_results(db_job["results_dir"])
+
     return JobResponse(
-        job_id=job.job_id,
-        status=job.status,
-        progress=job.progress,
-        result=job.result,
-        error=job.error,
-        error_details=job.error_details,
-        alignment_log=job.alignment_log,
-        refinement_log=job.refinement_log,
-        progress_history=job.progress_history,
-        raw_srt=job.raw_srt,
-        aligned_srt=job.aligned_srt,
-        refined_srt=job.refined_srt,
-        chunks_completed=job.chunks_completed,
-        total_chunks=job.total_chunks,
-        refined=job.refined,
-        queue_position=_compute_queue_position(job_id),
-        started_at=job.started_at,
-        estimated_wait_seconds=eta.get("wait_seconds"),
-        estimated_processing_seconds=eta.get("processing_seconds"),
-        estimated_completion=eta.get("completion"),
+        job_id=db_job["job_id"],
+        status=db_job["status"],
+        progress=1.0 if db_job["status"] == "completed" else 0.0,
+        result=result_srt,
+        error=db_job.get("error"),
+        refined=db_job.get("refined"),
+        started_at=db_job.get("started_at"),
+        audio_duration=db_job.get("audio_duration"),
     )
 
 
@@ -843,17 +881,20 @@ async def _process_job(
 
         # Save results to files
         _save_job_results(job, result, include_speaker)
+        _save_job_to_db(job)
 
     except ChalnaError as e:
         job.status = JobStatus.FAILED
         job.error = e.message
         job.error_details = {**e.to_dict(), "http_status": e.http_status}
         _save_job_error(job)
+        _save_job_to_db(job)
 
     except Exception as e:
         job.status = JobStatus.FAILED
         job.error = str(e)
         _save_job_error(job)
+        _save_job_to_db(job)
 
     finally:
         # Cleanup
@@ -863,6 +904,40 @@ async def _process_job(
 # =============================================================================
 # Startup/Shutdown
 # =============================================================================
+
+def _load_srt_from_results(results_dir_name: str) -> Optional[str]:
+    """Load the final SRT file from a results subdirectory."""
+    job_dir = RESULTS_DIR / results_dir_name
+    if not job_dir.is_dir():
+        return None
+    # Find .srt files that aren't intermediate (_raw, _aligned, _refined)
+    for srt_file in sorted(job_dir.glob("*.srt")):
+        if "_raw" not in srt_file.name and "_aligned" not in srt_file.name and "_refined" not in srt_file.name:
+            try:
+                return srt_file.read_text(encoding="utf-8")
+            except OSError:
+                return None
+    return None
+
+
+def _save_job_to_db(job: Job) -> None:
+    """Persist job metadata to SQLite."""
+    try:
+        db_save_job({
+            "job_id": job.job_id,
+            "status": job.status.value,
+            "created_at": job.created_at.isoformat(),
+            "started_at": job.started_at.isoformat() if job.started_at else None,
+            "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+            "audio_duration": job.audio_duration,
+            "error": job.error,
+            "refined": job.refined,
+            "results_dir": job.job_id[:8],
+            "has_result_files": True,
+        })
+    except Exception as e:
+        print(f"Failed to save job to DB: {e}")
+
 
 def _save_job_results(job: Job, result, include_speaker: bool) -> None:
     """Save job results to files for persistence.
@@ -963,8 +1038,17 @@ def _save_job_error(job: Job) -> None:
 
 @app.on_event("startup")
 async def startup():
-    """Start queue worker and preload models."""
+    """Initialize DB, migrate existing results, and start queue worker."""
     global _queue_worker_task
+
+    # Initialize SQLite DB
+    init_db(RESULTS_DIR)
+    migrated = migrate_from_results_dir(RESULTS_DIR)
+    if migrated > 0:
+        print(f"Migrated {migrated} existing jobs to DB")
+    total = db_count_jobs()
+    print(f"Job DB initialized: {total} jobs in history")
+
     _queue_worker_task = asyncio.create_task(_queue_worker())
     print(f"Job queue worker started")
     print(f"Results will be saved to: {RESULTS_DIR}")

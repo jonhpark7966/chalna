@@ -295,6 +295,106 @@ details summary:hover { background: var(--accent-bright); }
 
 .error-box .error-title { font-weight: 600; margin-bottom: 4px; }
 .error-box .error-msg { font-size: 0.9rem; }
+
+/* --- History Panel --- */
+.history-panel {
+  max-width: 1200px;
+  margin: 0 auto 24px;
+  padding: 0 24px;
+}
+
+.history-panel .panel { padding: 16px 20px; }
+
+.history-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.history-header h2 { margin-bottom: 0; }
+
+.history-header .total-count {
+  font-size: 0.8rem;
+  color: var(--text-dim);
+}
+
+.history-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+
+.history-table th {
+  text-align: left;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-dim);
+  font-weight: 500;
+  font-size: 0.8rem;
+  white-space: nowrap;
+}
+
+.history-table td {
+  padding: 8px 10px;
+  border-bottom: 1px solid rgba(42, 58, 94, 0.4);
+  vertical-align: middle;
+}
+
+.history-table tr { cursor: pointer; transition: background 0.15s; }
+.history-table tbody tr:hover { background: rgba(15, 52, 96, 0.3); }
+.history-table tr.selected { background: rgba(15, 52, 96, 0.5); }
+
+.status-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 6px;
+  vertical-align: middle;
+}
+
+.status-dot.completed { background: var(--success); }
+.status-dot.failed { background: var(--error); }
+
+.badge-sm {
+  display: inline-block;
+  font-size: 0.7rem;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-weight: 500;
+}
+
+.badge-sm.refined { background: var(--success); color: #fff; }
+.badge-sm.unrefined { background: var(--warning); color: #1a1a2e; }
+.badge-sm.no-files { background: rgba(255,255,255,0.1); color: var(--text-dim); }
+
+.history-empty {
+  text-align: center;
+  padding: 24px;
+  color: var(--text-dim);
+  font-size: 0.9rem;
+}
+
+.history-pager {
+  display: flex;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.history-pager button {
+  padding: 4px 14px;
+  background: var(--accent);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.history-pager button:disabled { opacity: 0.3; cursor: not-allowed; }
+.history-pager button:hover:not(:disabled) { background: var(--accent-bright); }
 </style>
 </head>
 <body>
@@ -365,6 +465,33 @@ details summary:hover { background: var(--accent-bright); }
         <div class="error-title" id="error-title">오류</div>
         <div class="error-msg" id="error-msg"></div>
       </div>
+    </div>
+  </div>
+</div>
+
+<!-- History Panel -->
+<div class="history-panel">
+  <div class="panel">
+    <div class="history-header">
+      <h2>히스토리</h2>
+      <span class="total-count" id="history-count"></span>
+    </div>
+    <table class="history-table" id="history-table">
+      <thead>
+        <tr>
+          <th>상태</th>
+          <th>일시</th>
+          <th>길이</th>
+          <th>교정</th>
+          <th>파일</th>
+        </tr>
+      </thead>
+      <tbody id="history-body"></tbody>
+    </table>
+    <div class="history-empty" id="history-empty" style="display:none">기록이 없습니다.</div>
+    <div class="history-pager" id="history-pager" style="display:none">
+      <button id="history-prev" disabled>이전</button>
+      <button id="history-next" disabled>다음</button>
     </div>
   </div>
 </div>
@@ -591,6 +718,7 @@ details summary:hover { background: var(--accent-bright); }
 
     if (job.status === 'completed') {
       showResult(job);
+      loadHistory();
       return;
     }
 
@@ -599,6 +727,7 @@ details summary:hover { background: var(--accent-bright); }
       const title = code ? `오류 [${code}]` : '오류';
       showError(title, job.error || '알 수 없는 오류');
       btnSubmit.disabled = false;
+      loadHistory();
       return;
     }
   }
@@ -627,8 +756,14 @@ details summary:hover { background: var(--accent-bright); }
     }
 
     // Duration
-    const elapsed = ((Date.now() - jobStartTime) / 1000);
-    resultDuration.textContent = `소요 시간: ${formatDuration(elapsed)}`;
+    if (jobStartTime) {
+      const elapsed = ((Date.now() - jobStartTime) / 1000);
+      resultDuration.textContent = `소요 시간: ${formatDuration(elapsed)}`;
+    } else if (job.audio_duration) {
+      resultDuration.textContent = `오디오 길이: ${formatDuration(job.audio_duration)}`;
+    } else {
+      resultDuration.textContent = '';
+    }
 
     // Download
     btnDownload.onclick = () => downloadSrt(job.result || '', 'output.srt');
@@ -702,6 +837,131 @@ details summary:hover { background: var(--accent-bright); }
     div.textContent = str;
     return div.innerHTML;
   }
+
+  // ==========================================================================
+  // Job History
+  // ==========================================================================
+  const historyBody = document.getElementById('history-body');
+  const historyCount = document.getElementById('history-count');
+  const historyEmpty = document.getElementById('history-empty');
+  const historyPager = document.getElementById('history-pager');
+  const historyPrev = document.getElementById('history-prev');
+  const historyNext = document.getElementById('history-next');
+
+  const PAGE_SIZE = 20;
+  let historyOffset = 0;
+  let historyTotal = 0;
+
+  async function loadHistory() {
+    try {
+      const res = await fetch(`/jobs?limit=${PAGE_SIZE}&offset=${historyOffset}`);
+      if (!res.ok) return;
+      const data = await res.json();
+      historyTotal = data.total;
+      renderHistory(data.jobs);
+    } catch (err) {
+      console.error('History load error:', err);
+    }
+  }
+
+  function renderHistory(jobs) {
+    historyCount.textContent = `${historyTotal}건`;
+
+    if (jobs.length === 0 && historyOffset === 0) {
+      historyBody.innerHTML = '';
+      historyEmpty.style.display = '';
+      historyPager.style.display = 'none';
+      return;
+    }
+
+    historyEmpty.style.display = 'none';
+    historyBody.innerHTML = '';
+
+    for (const job of jobs) {
+      const tr = document.createElement('tr');
+      tr.dataset.jobId = job.job_id;
+
+      // Status
+      const statusDot = `<span class="status-dot ${job.status}"></span>${job.status === 'completed' ? '완료' : '실패'}`;
+
+      // Date
+      const dt = job.created_at ? new Date(job.created_at + 'Z') : null;
+      const dateStr = dt ? dt.toLocaleString('ko-KR', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '-';
+
+      // Duration
+      let durStr = '-';
+      if (job.audio_duration) {
+        durStr = formatDuration(job.audio_duration);
+      }
+
+      // Refined badge
+      let refinedHtml = '-';
+      if (job.refined === true) {
+        refinedHtml = '<span class="badge-sm refined">O</span>';
+      } else if (job.refined === false) {
+        refinedHtml = '<span class="badge-sm unrefined">X</span>';
+      }
+
+      // Files available
+      let filesHtml = job.has_result_files ? 'O' : '<span class="badge-sm no-files">-</span>';
+
+      tr.innerHTML = `<td>${statusDot}</td><td>${dateStr}</td><td>${durStr}</td><td>${refinedHtml}</td><td>${filesHtml}</td>`;
+
+      tr.addEventListener('click', () => viewHistoryJob(job.job_id));
+      historyBody.appendChild(tr);
+    }
+
+    // Pager
+    if (historyTotal > PAGE_SIZE) {
+      historyPager.style.display = '';
+      historyPrev.disabled = historyOffset === 0;
+      historyNext.disabled = historyOffset + PAGE_SIZE >= historyTotal;
+    } else {
+      historyPager.style.display = 'none';
+    }
+  }
+
+  async function viewHistoryJob(jobId) {
+    try {
+      const res = await fetch(`/jobs/${jobId}`);
+      if (!res.ok) return;
+      const job = await res.json();
+
+      // Highlight selected row
+      historyBody.querySelectorAll('tr').forEach(r => r.classList.remove('selected'));
+      const row = historyBody.querySelector(`tr[data-job-id="${jobId}"]`);
+      if (row) row.classList.add('selected');
+
+      if (job.status === 'completed' && job.result) {
+        jobStartTime = null;
+        showResult(job);
+      } else if (job.status === 'completed') {
+        showView('result');
+        srtOutput.value = '(결과 파일이 삭제되었습니다)';
+        resultBadge.innerHTML = '';
+        resultDuration.textContent = '';
+        intermediateSection.style.display = 'none';
+        btnDownload.onclick = null;
+      } else if (job.status === 'failed') {
+        showError('오류', job.error || '알 수 없는 오류');
+      }
+    } catch (err) {
+      console.error('View job error:', err);
+    }
+  }
+
+  historyPrev.addEventListener('click', () => {
+    historyOffset = Math.max(0, historyOffset - PAGE_SIZE);
+    loadHistory();
+  });
+
+  historyNext.addEventListener('click', () => {
+    historyOffset += PAGE_SIZE;
+    loadHistory();
+  });
+
+  // Load history on page load
+  loadHistory();
 })();
 </script>
 </body>

@@ -358,6 +358,9 @@ class JobResponse(BaseModel):
     started_at: Optional[datetime] = None
     # Audio info
     audio_duration: Optional[float] = None
+    # Stage tracking
+    current_stage: Optional[str] = None
+    stage_timestamps: Dict[str, str] = Field(default_factory=dict)
     # ETA estimation
     estimated_wait_seconds: Optional[float] = None
     estimated_processing_seconds: Optional[float] = None
@@ -644,6 +647,47 @@ async def list_jobs(
     return {"jobs": jobs, "total": total, "limit": limit, "offset": offset}
 
 
+@app.get("/jobs/active")
+async def get_active_jobs():
+    """Get currently active (processing/queued) jobs for live monitoring."""
+    active = []
+    for job in _jobs.values():
+        if job.status in (JobStatus.PROCESSING, JobStatus.QUEUED):
+            eta = _compute_eta(job.job_id)
+            # Extract current stage and stage timestamps from progress_history
+            current_stage = None
+            stage_timestamps = {}
+            for entry in job.progress_history:
+                stage = entry.get("stage")
+                ts = entry.get("timestamp")
+                if stage and ts:
+                    if stage not in stage_timestamps:
+                        stage_timestamps[stage] = ts
+                    current_stage = stage
+
+            active.append({
+                "job_id": job.job_id,
+                "status": job.status.value,
+                "progress": job.progress,
+                "current_stage": current_stage,
+                "stage_timestamps": stage_timestamps,
+                "progress_history": job.progress_history,
+                "raw_srt": job.raw_srt,
+                "aligned_srt": job.aligned_srt,
+                "refined_srt": job.refined_srt,
+                "chunks_completed": job.chunks_completed,
+                "total_chunks": job.total_chunks,
+                "started_at": job.started_at.isoformat() if job.started_at else None,
+                "created_at": job.created_at.isoformat(),
+                "audio_duration": job.audio_duration,
+                "queue_position": _compute_queue_position(job.job_id),
+                "estimated_wait_seconds": eta.get("wait_seconds"),
+                "estimated_processing_seconds": eta.get("processing_seconds"),
+                "estimated_completion": eta.get("completion").isoformat() if eta.get("completion") else None,
+            })
+    return {"jobs": active}
+
+
 @app.get("/jobs/{job_id}", response_model=JobResponse)
 async def get_job(job_id: str):
     """
@@ -655,6 +699,18 @@ async def get_job(job_id: str):
     if job_id in _jobs:
         job = _jobs[job_id]
         eta = _compute_eta(job_id)
+
+        # Extract current stage and stage timestamps from progress_history
+        current_stage = None
+        stage_timestamps = {}
+        for entry in job.progress_history:
+            stage = entry.get("stage")
+            ts = entry.get("timestamp")
+            if stage and ts:
+                if stage not in stage_timestamps:
+                    stage_timestamps[stage] = ts
+                current_stage = stage
+
         return JobResponse(
             job_id=job.job_id,
             status=job.status,
@@ -674,6 +730,8 @@ async def get_job(job_id: str):
             queue_position=_compute_queue_position(job_id),
             started_at=job.started_at,
             audio_duration=job.audio_duration,
+            current_stage=current_stage,
+            stage_timestamps=stage_timestamps,
             estimated_wait_seconds=eta.get("wait_seconds"),
             estimated_processing_seconds=eta.get("processing_seconds"),
             estimated_completion=eta.get("completion"),
@@ -790,16 +848,32 @@ async def _process_job(
             job.total_chunks = kwargs.get("total_chunks", 0)
 
         # Map stage progress to overall job progress
+        # Weights match actual pipeline order:
+        # validating → transcribing → loading_models → aligning → refining
         stage_weights = {
             "validating": (0.0, 0.05),
-            "loading_models": (0.05, 0.25),
-            "transcribing": (0.25, 0.55),
-            "aligning": (0.55, 0.75),
-            "refining": (0.75, 0.95),
+            "transcribing": (0.05, 0.55),
+            "loading_models": (0.55, 0.60),
+            "aligning": (0.60, 0.80),
+            "refining": (0.80, 0.95),
         }
         if stage in stage_weights:
             start, end = stage_weights[stage]
             job.progress = start + (end - start) * progress
+
+        # Store intermediate results as stages complete
+        if progress >= 1.0:
+            try:
+                from chalna.srt_utils import segments_to_srt
+                p = get_pipeline()
+                if stage == "transcribing" and p._raw_segments:
+                    job.raw_srt = segments_to_srt(p._raw_segments, include_speaker=True)
+                elif stage == "aligning" and p._aligned_segments:
+                    job.aligned_srt = segments_to_srt(p._aligned_segments, include_speaker=True)
+                elif stage == "refining" and p._refined_segments:
+                    job.refined_srt = segments_to_srt(p._refined_segments, include_speaker=True)
+            except Exception:
+                pass  # Don't fail job for monitoring side-effects
 
     try:
         job.status = JobStatus.PROCESSING

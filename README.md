@@ -29,11 +29,12 @@ pip install -e external/VibeVoice
 
 ### LLM Refinement 설정 (Optional)
 
-LLM refinement 기능을 사용하려면 [Codex CLI](https://github.com/anthropics/codex)가 필요합니다.
+LLM refinement 기능을 사용하려면 [Codex CLI](https://github.com/openai/codex)가 필요합니다.
+기본 refinement 모델은 `gpt-5.5`입니다.
 
 ```bash
 # Codex CLI 설치
-npm install -g @anthropic-ai/codex
+npm install -g @openai/codex
 
 # venv 환경에서 실행 시 symlink 필요
 # (venv의 PATH에 npm global bin이 포함되지 않음)

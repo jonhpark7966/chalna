@@ -395,6 +395,170 @@ details summary:hover { background: var(--accent-bright); }
 
 .history-pager button:disabled { opacity: 0.3; cursor: not-allowed; }
 .history-pager button:hover:not(:disabled) { background: var(--accent-bright); }
+
+/* Pipeline Stepper */
+.progress-header { margin-bottom: 20px; }
+.progress-title { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px; }
+.progress-title span:first-child { font-size: 1rem; font-weight: 500; }
+.progress-pct { font-size: 1.2rem; font-weight: 700; color: var(--accent-bright); }
+.progress-meta { display: flex; justify-content: space-between; font-size: 0.85rem; color: var(--text-dim); margin-top: 6px; }
+
+.pipeline-stepper { margin: 16px 0; }
+
+.step {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 10px 0;
+  position: relative;
+}
+
+/* Connecting line */
+.step:not(:last-child)::after {
+  content: '';
+  position: absolute;
+  left: 13px;
+  top: 36px;
+  bottom: -10px;
+  width: 2px;
+  background: var(--border);
+}
+
+.step.done:not(:last-child)::after { background: var(--success); }
+.step.active:not(:last-child)::after { background: linear-gradient(to bottom, var(--success), var(--border)); }
+
+.step-icon {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.85rem;
+  flex-shrink: 0;
+  border: 2px solid var(--border);
+  color: var(--text-dim);
+  background: var(--bg);
+  z-index: 1;
+}
+
+.step.done .step-icon {
+  background: var(--success);
+  border-color: var(--success);
+  color: #fff;
+}
+
+.step.active .step-icon {
+  border-color: var(--accent-bright);
+  color: var(--accent-bright);
+  animation: pulse-ring 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse-ring {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(26, 82, 118, 0.4); }
+  50% { box-shadow: 0 0 0 6px rgba(26, 82, 118, 0); }
+}
+
+.step-content { flex: 1; min-width: 0; }
+.step-name { font-size: 0.9rem; font-weight: 500; }
+.step.pending .step-name { color: var(--text-dim); }
+.step.active .step-name { color: var(--text); }
+.step.done .step-name { color: var(--success); }
+
+.step-detail { font-size: 0.8rem; color: var(--text-dim); margin-top: 2px; }
+
+.step-mini-bar {
+  width: 100%;
+  height: 3px;
+  background: var(--bg);
+  border-radius: 2px;
+  margin-top: 6px;
+  overflow: hidden;
+}
+
+.step-mini-fill {
+  height: 100%;
+  background: var(--accent-bright);
+  border-radius: 2px;
+  transition: width 0.5s ease;
+}
+
+.step-intermediate-btn {
+  display: inline-block;
+  margin-top: 6px;
+  padding: 3px 10px;
+  font-size: 0.75rem;
+  background: rgba(15, 52, 96, 0.5);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  cursor: pointer;
+}
+.step-intermediate-btn:hover { background: var(--accent); }
+
+/* SRT Preview Modal */
+.srt-modal-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.6);
+  z-index: 100;
+  align-items: center;
+  justify-content: center;
+}
+.srt-modal-overlay.show { display: flex; }
+
+.srt-modal {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  width: 90%;
+  max-width: 700px;
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.srt-modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  font-weight: 600;
+}
+
+.srt-modal-close {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  font-size: 1.2rem;
+  cursor: pointer;
+}
+
+.srt-modal-body {
+  padding: 16px;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.srt-modal-body textarea {
+  width: 100%;
+  min-height: 300px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  font-family: 'Consolas', 'Monaco', monospace;
+  font-size: 0.82rem;
+  padding: 12px;
+  resize: vertical;
+  line-height: 1.5;
+}
+
+.live-intermediate { margin-top: 16px; }
+.live-intermediate h4 { font-size: 0.85rem; color: var(--text-dim); margin-bottom: 8px; }
+.intermediate-btns { display: flex; gap: 8px; flex-wrap: wrap; }
 </style>
 </head>
 <body>
@@ -435,13 +599,28 @@ details summary:hover { background: var(--accent-bright); }
     </div>
 
     <div id="view-progress" style="display:none">
-      <div class="progress-section">
-        <div class="stage" id="progress-stage">준비 중...</div>
+      <!-- Overall progress header -->
+      <div class="progress-header">
+        <div class="progress-title">
+          <span id="progress-overall-text">처리 중...</span>
+          <span class="progress-pct" id="progress-pct-text">0%</span>
+        </div>
         <div class="progress-bar-bg"><div class="progress-bar-fill" id="progress-bar"></div></div>
-        <div class="meta" id="progress-percent"></div>
-        <div class="meta" id="progress-queue"></div>
-        <div class="meta" id="progress-chunks"></div>
-        <div class="meta" id="progress-eta"></div>
+        <div class="progress-meta">
+          <span id="progress-elapsed">경과: 0초</span>
+          <span id="progress-eta-text"></span>
+        </div>
+      </div>
+
+      <!-- Pipeline Stepper -->
+      <div class="pipeline-stepper" id="pipeline-stepper">
+        <!-- Steps will be generated by JS -->
+      </div>
+
+      <!-- Intermediate Results (shown as they become available) -->
+      <div class="live-intermediate" id="live-intermediate" style="display:none">
+        <h4>중간 결과물</h4>
+        <div class="intermediate-btns" id="live-intermediate-btns"></div>
       </div>
     </div>
 
@@ -496,19 +675,31 @@ details summary:hover { background: var(--accent-bright); }
   </div>
 </div>
 
+<div class="srt-modal-overlay" id="srt-modal">
+  <div class="srt-modal">
+    <div class="srt-modal-header">
+      <span id="srt-modal-title">중간 결과</span>
+      <button class="srt-modal-close" onclick="closeSrtModal()">&times;</button>
+    </div>
+    <div class="srt-modal-body">
+      <textarea id="srt-modal-content" readonly></textarea>
+    </div>
+  </div>
+</div>
+
 <script>
 (function() {
   'use strict';
 
-  // --- Stage name mapping ---
-  const STAGE_NAMES = {
-    'queued': '대기 중',
-    'loading_models': '모델 로딩 중',
-    'transcribing': '자막 생성 중 (VibeVoice)',
-    'aligning': '타임스탬프 정렬 중 (Qwen)',
-    'refining': '자막 교정 중 (LLM)',
-    'saving': '결과 저장 중',
-  };
+  // --- Pipeline stages ---
+  // Order must match actual pipeline execution order
+  const PIPELINE_STAGES = [
+    { key: 'validating', name: '오디오 검증' },
+    { key: 'transcribing', name: '자막 생성 (VibeVoice ASR)' },
+    { key: 'loading_models', name: '정렬 모델 로딩' },
+    { key: 'aligning', name: '타임스탬프 정렬 (Qwen)' },
+    { key: 'refining', name: '자막 교정 (LLM)' },
+  ];
 
   // --- DOM refs ---
   const dropZone = document.getElementById('drop-zone');
@@ -523,12 +714,11 @@ details summary:hover { background: var(--accent-bright); }
   const viewResult = document.getElementById('view-result');
   const viewError = document.getElementById('view-error');
 
-  const progressStage = document.getElementById('progress-stage');
+  const progressOverallText = document.getElementById('progress-overall-text');
+  const progressPctText = document.getElementById('progress-pct-text');
   const progressBar = document.getElementById('progress-bar');
-  const progressPercent = document.getElementById('progress-percent');
-  const progressQueue = document.getElementById('progress-queue');
-  const progressChunks = document.getElementById('progress-chunks');
-  const progressEta = document.getElementById('progress-eta');
+  const progressElapsed = document.getElementById('progress-elapsed');
+  const progressEtaText = document.getElementById('progress-eta-text');
 
   const srtOutput = document.getElementById('srt-output');
   const btnDownload = document.getElementById('btn-download');
@@ -606,13 +796,14 @@ details summary:hover { background: var(--accent-bright); }
     // UI: show progress
     showView('progress');
     btnSubmit.disabled = true;
-    progressStage.textContent = '업로드 중...';
+    progressOverallText.textContent = '업로드 중...';
+    progressPctText.textContent = '';
     progressBar.style.width = '0%';
-    progressPercent.textContent = '';
-    progressQueue.textContent = '';
-    progressChunks.textContent = '';
-    progressEta.textContent = '';
+    progressElapsed.textContent = '';
+    progressEtaText.textContent = '';
+    document.getElementById('pipeline-stepper').innerHTML = '';
     jobStartTime = Date.now();
+    stopIdlePolling();
 
     try {
       const res = await fetch('/transcribe/async', { method: 'POST', body: fd });
@@ -626,24 +817,23 @@ details summary:hover { background: var(--accent-bright); }
 
       // Show initial ETA
       if (data.estimated_processing_seconds) {
-        progressEta.textContent = `예상 처리 시간: ${formatDuration(data.estimated_processing_seconds)}`;
-      }
-      if (data.estimated_wait_seconds > 0) {
-        progressQueue.textContent = `예상 대기: ${formatDuration(data.estimated_wait_seconds)}`;
+        progressEtaText.textContent = `예상: ${formatDuration(data.estimated_processing_seconds)}`;
       }
 
       // Start polling
       startPolling(jobId);
+      startElapsedTimer(null);
     } catch (err) {
       showError('요청 실패', err.message);
       btnSubmit.disabled = false;
+      startIdlePolling();
     }
   });
 
   // --- Polling ---
   function startPolling(jobId) {
     if (pollTimer) clearInterval(pollTimer);
-    pollTimer = setInterval(() => pollJob(jobId), 2000);
+    pollTimer = setInterval(() => pollJob(jobId), 1500);
     // Immediate first poll
     pollJob(jobId);
   }
@@ -655,79 +845,82 @@ details summary:hover { background: var(--accent-bright); }
       const job = await res.json();
       updateProgress(job);
     } catch (err) {
-      // Network error — keep polling, don't stop
+      // Network error -- keep polling, don't stop
       console.error('Poll error:', err);
     }
   }
 
   function updateProgress(job) {
+    window._currentJobData = job;
+
     if (job.status === 'queued') {
-      progressStage.textContent = STAGE_NAMES['queued'];
+      progressOverallText.textContent = '대기 중';
+      progressPctText.textContent = '';
       progressBar.style.width = '0%';
-      progressPercent.textContent = '';
+      progressElapsed.textContent = '';
+
+      let etaText = '';
       if (job.queue_position != null && job.queue_position > 0) {
-        progressQueue.textContent = `큐 위치: #${job.queue_position}`;
+        etaText = '큐 위치: #' + job.queue_position;
       }
       if (job.estimated_wait_seconds > 0) {
-        progressEta.textContent = `예상 대기: ${formatDuration(job.estimated_wait_seconds)}`;
+        etaText += (etaText ? ' / ' : '') + '예상 대기: ' + formatDuration(job.estimated_wait_seconds);
       }
-      if (job.estimated_completion) {
-        const completionTime = new Date(job.estimated_completion).toLocaleTimeString('ko-KR');
-        progressEta.textContent += ` / 예상 완료: ${completionTime}`;
-      }
+      progressEtaText.textContent = etaText;
+
+      // Show empty stepper (all pending)
+      renderStepper(job);
       return;
     }
 
     if (job.status === 'processing') {
-      // Determine current stage from progress_history
-      let currentStage = 'processing';
-      if (job.progress_history && job.progress_history.length > 0) {
-        const last = job.progress_history[job.progress_history.length - 1];
-        currentStage = last.stage || 'processing';
-      }
-
-      progressStage.textContent = STAGE_NAMES[currentStage] || currentStage;
       const pct = Math.round(job.progress * 100);
+      progressOverallText.textContent = '처리 중';
+      progressPctText.textContent = pct + '%';
       progressBar.style.width = pct + '%';
-      progressPercent.textContent = `${pct}%`;
-      progressQueue.textContent = '';
 
-      // Chunks
-      if (job.total_chunks > 0) {
-        progressChunks.textContent = `${job.chunks_completed}/${job.total_chunks} 청크 완료`;
-      } else {
-        progressChunks.textContent = '';
+      // Elapsed time
+      if (job.started_at && !monitoredJobStartTime) {
+        startElapsedTimer(job.started_at);
       }
 
       // ETA
       if (job.estimated_completion) {
         const remaining = (new Date(job.estimated_completion) - Date.now()) / 1000;
         if (remaining > 0) {
-          progressEta.textContent = `남은 시간: ${formatDuration(remaining)}`;
+          progressEtaText.textContent = '남은: ' + formatDuration(remaining);
         } else {
-          progressEta.textContent = '거의 완료...';
+          progressEtaText.textContent = '거의 완료...';
         }
       } else if (job.estimated_processing_seconds) {
-        progressEta.textContent = `남은 시간: ${formatDuration(job.estimated_processing_seconds)}`;
+        progressEtaText.textContent = '남은: ' + formatDuration(job.estimated_processing_seconds);
+      } else {
+        progressEtaText.textContent = '';
       }
+
+      // Render pipeline stepper
+      renderStepper(job);
       return;
     }
 
-    // Terminal states — stop polling
+    // Terminal states -- stop polling
     stopPolling();
+    stopElapsedTimer();
 
     if (job.status === 'completed') {
       showResult(job);
       loadHistory();
+      startIdlePolling();
       return;
     }
 
     if (job.status === 'failed') {
       const code = job.error_details?.error_code || '';
-      const title = code ? `오류 [${code}]` : '오류';
+      const title = code ? '오류 [' + code + ']' : '오류';
       showError(title, job.error || '알 수 없는 오류');
       btnSubmit.disabled = false;
       loadHistory();
+      startIdlePolling();
       return;
     }
   }
@@ -736,6 +929,174 @@ details summary:hover { background: var(--accent-bright); }
     if (pollTimer) {
       clearInterval(pollTimer);
       pollTimer = null;
+    }
+  }
+
+  // --- Pipeline Stepper ---
+  function renderStepper(job) {
+    const stepper = document.getElementById('pipeline-stepper');
+    const currentStage = job.current_stage;
+
+    // Parse stage timestamps from progress_history
+    const stageStart = {};
+    const stageEnd = {};
+    const stageProgress = {};
+
+    for (const entry of (job.progress_history || [])) {
+      const s = entry.stage;
+      const t = entry.timestamp;
+      const p = entry.progress;
+      if (!s || !t) continue;
+      if (!(s in stageStart)) stageStart[s] = t;
+      stageEnd[s] = t;
+      stageProgress[s] = p;
+    }
+
+    let html = '';
+
+    for (const stage of PIPELINE_STAGES) {
+      const isDone = stageProgress[stage.key] >= 1.0;
+      const isActive = stage.key === currentStage && !isDone;
+
+      let stateClass = 'pending';
+      let iconHtml = '<span style="font-size:0.7rem">&#9675;</span>';
+
+      if (isDone) {
+        stateClass = 'done';
+        iconHtml = '&#10003;';
+      } else if (isActive) {
+        stateClass = 'active';
+        iconHtml = '<span style="font-size:0.7rem">&#9679;</span>';
+      }
+
+      // Time info
+      let detail = '';
+      if (isDone && stageStart[stage.key] && stageEnd[stage.key]) {
+        const startTs = new Date(stageStart[stage.key]).getTime();
+        const endTs = new Date(stageEnd[stage.key]).getTime();
+        const elapsed = Math.round((endTs - startTs) / 1000);
+        if (elapsed > 0) {
+          detail = formatDuration(elapsed);
+        }
+      } else if (isActive && stageStart[stage.key]) {
+        const startTs = new Date(stageStart[stage.key]).getTime();
+        const elapsed = Math.round((Date.now() - startTs) / 1000);
+        detail = formatDuration(elapsed) + ' 경과';
+      }
+
+      // Chunk info for transcribing
+      let chunkHtml = '';
+      if (stage.key === 'transcribing' && job.total_chunks > 0) {
+        chunkHtml = '<div class="step-detail">' + job.chunks_completed + '/' + job.total_chunks + ' 청크</div>';
+      }
+
+      // Mini progress bar for active stage
+      let miniBar = '';
+      if (isActive && stageProgress[stage.key] != null) {
+        const pctVal = Math.round(stageProgress[stage.key] * 100);
+        miniBar = '<div class="step-mini-bar"><div class="step-mini-fill" style="width:' + pctVal + '%"></div></div>';
+      }
+
+      // Intermediate result button
+      let intermediateBtn = '';
+      if (isDone) {
+        if (stage.key === 'transcribing' && job.raw_srt) {
+          intermediateBtn = '<button class="step-intermediate-btn" onclick="showSrtModal(\'Raw ASR 결과\', window._currentJobData.raw_srt)">결과 보기</button>';
+        } else if (stage.key === 'aligning' && job.aligned_srt) {
+          intermediateBtn = '<button class="step-intermediate-btn" onclick="showSrtModal(\'정렬 결과\', window._currentJobData.aligned_srt)">결과 보기</button>';
+        } else if (stage.key === 'refining' && job.refined_srt) {
+          intermediateBtn = '<button class="step-intermediate-btn" onclick="showSrtModal(\'교정 결과\', window._currentJobData.refined_srt)">결과 보기</button>';
+        }
+      }
+
+      html += '<div class="step ' + stateClass + '">' +
+        '<div class="step-icon">' + iconHtml + '</div>' +
+        '<div class="step-content">' +
+          '<div class="step-name">' + stage.name + '</div>' +
+          (detail ? '<div class="step-detail">' + detail + '</div>' : '') +
+          chunkHtml +
+          miniBar +
+          intermediateBtn +
+        '</div>' +
+      '</div>';
+    }
+
+    stepper.innerHTML = html;
+  }
+
+  // --- Elapsed Timer ---
+  let elapsedTimer = null;
+  let monitoredJobStartTime = null;
+
+  function startElapsedTimer(startedAt) {
+    monitoredJobStartTime = startedAt ? new Date(startedAt).getTime() : Date.now();
+    if (elapsedTimer) clearInterval(elapsedTimer);
+    elapsedTimer = setInterval(function() {
+      const elapsed = Math.round((Date.now() - monitoredJobStartTime) / 1000);
+      const el = document.getElementById('progress-elapsed');
+      if (el) el.textContent = '경과: ' + formatDuration(elapsed);
+    }, 1000);
+  }
+
+  function stopElapsedTimer() {
+    if (elapsedTimer) {
+      clearInterval(elapsedTimer);
+      elapsedTimer = null;
+    }
+    monitoredJobStartTime = null;
+  }
+
+  // --- SRT Modal ---
+  function showSrtModal(title, content) {
+    document.getElementById('srt-modal-title').textContent = title;
+    document.getElementById('srt-modal-content').value = content || '';
+    document.getElementById('srt-modal').classList.add('show');
+  }
+
+  function closeSrtModal() {
+    document.getElementById('srt-modal').classList.remove('show');
+  }
+
+  // Close on overlay click
+  document.getElementById('srt-modal').addEventListener('click', function(e) {
+    if (e.target === this) closeSrtModal();
+  });
+
+  // Expose to window for onclick handlers
+  window.showSrtModal = showSrtModal;
+  window.closeSrtModal = closeSrtModal;
+
+  // --- Active Job Detection ---
+  let idlePollTimer = null;
+
+  async function checkActiveJobs() {
+    try {
+      const res = await fetch('/jobs/active');
+      if (!res.ok) return;
+      const data = await res.json();
+      if (data.jobs && data.jobs.length > 0) {
+        // Found active job -- start monitoring
+        const activeJob = data.jobs.find(function(j) { return j.status === 'processing'; }) || data.jobs[0];
+        showView('progress');
+        jobStartTime = activeJob.started_at ? new Date(activeJob.started_at).getTime() : Date.now();
+        startPolling(activeJob.job_id);
+        startElapsedTimer(activeJob.started_at);
+        stopIdlePolling();
+      }
+    } catch (err) {
+      console.error('Active job check error:', err);
+    }
+  }
+
+  function startIdlePolling() {
+    if (idlePollTimer) return;
+    idlePollTimer = setInterval(checkActiveJobs, 5000);
+  }
+
+  function stopIdlePolling() {
+    if (idlePollTimer) {
+      clearInterval(idlePollTimer);
+      idlePollTimer = null;
     }
   }
 
@@ -962,6 +1323,10 @@ details summary:hover { background: var(--accent-bright); }
 
   // Load history on page load
   loadHistory();
+
+  // Check for active jobs on page load
+  checkActiveJobs();
+  startIdlePolling();
 })();
 </script>
 </body>

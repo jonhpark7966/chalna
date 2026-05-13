@@ -729,18 +729,13 @@ class ChalnaPipeline:
         finally:
             # Always unload VibeVoice to free GPU (even on error)
             self._unload_vibevoice()
-        _progress("transcribing", 1.0)
-
-        # Load aligner model
-        _progress("loading_models", 0.0)
-        self._load_aligner()
-        _progress("loading_models", 1.0)
 
         # Check for empty transcription
         if not segments:
             raise EmptyTranscriptionError(audio_duration=audio_info.duration_seconds)
 
-        # Store raw segments (Stage 1)
+        # Store raw segments (Stage 1) — before progress callback so
+        # live monitoring can capture them
         self._raw_segments = [
             Segment(
                 index=s.index,
@@ -754,6 +749,12 @@ class ChalnaPipeline:
         ]
         # Keep backward compatibility
         self._pre_alignment_segments = self._raw_segments
+        _progress("transcribing", 1.0)
+
+        # Load aligner model
+        _progress("loading_models", 0.0)
+        self._load_aligner()
+        _progress("loading_models", 1.0)
 
         # Step 2: Qwen Forced Alignment (optional)
         _progress("aligning", 0.0)
@@ -763,9 +764,8 @@ class ChalnaPipeline:
                 print("  [idx]   original_start → aligned_start (delta) | original_end → aligned_end (delta)")
                 print("  " + "-" * 80)
             segments = self._run_alignment(audio_path, segments, verbose=verbose)
-        _progress("aligning", 1.0)
 
-        # Store aligned segments (Stage 2)
+        # Store aligned segments (Stage 2) — before progress callback
         self._aligned_segments = [
             Segment(
                 index=s.index,
@@ -777,6 +777,7 @@ class ChalnaPipeline:
             )
             for s in segments
         ]
+        _progress("aligning", 1.0)
 
         # Step 3: LLM Refinement (optional)
         if self.use_llm_refinement:

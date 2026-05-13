@@ -38,7 +38,7 @@ class RefinementOutput:
 
 def call_codex_cli(
     prompt: str,
-    model: str = "gpt-5.2",
+    model: str = "gpt-5.5",
     reasoning_effort: str = "medium",
     timeout: int = 120,
 ) -> str:
@@ -49,7 +49,7 @@ def call_codex_cli(
 
     Args:
         prompt: The prompt to send
-        model: Model to use (default: gpt-5.2)
+        model: Model to use (default: gpt-5.5)
         reasoning_effort: Reasoning effort level (minimal/low/medium/high/xhigh)
         timeout: Timeout in seconds
 

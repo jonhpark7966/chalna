@@ -377,7 +377,7 @@ def transcribe(
         console.print(f"  Reason: {e.details['reason']}")
         console.print()
         console.print("[dim]Suggestions:[/dim]")
-        console.print("  - Check that Codex CLI is installed: npm install -g @anthropic-ai/codex")
+        console.print("  - Check that Codex CLI is installed: npm install -g @openai/codex")
         console.print("  - Run with --no-llm-refine to skip LLM refinement")
         raise typer.Exit(code=1)
 

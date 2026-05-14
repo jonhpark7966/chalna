@@ -53,11 +53,15 @@ htmlcov/
 # Uploaded/temp files
 uploads/
 temp/
+results/
 *.wav
 *.mp3
 *.mp4
 *.srt
 *.json
+*.db
+*.db-shm
+*.db-wal
 
 # Model cache (large files)
 models/

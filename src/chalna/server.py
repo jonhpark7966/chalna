@@ -27,6 +27,7 @@ from chalna import __version__
 from chalna.db import init_db, save_job as db_save_job, list_jobs as db_list_jobs, get_job as db_get_job, count_jobs as db_count_jobs, migrate_from_results_dir
 from chalna.exceptions import ChalnaError
 from chalna.monitoring import capture_job_exception, init_sentry
+from chalna.settings import settings
 from chalna.validation import validate_audio_file
 
 
@@ -34,7 +35,12 @@ from chalna.validation import validate_audio_file
 # App Setup
 # =============================================================================
 
-init_sentry()
+init_sentry(
+    dsn=settings.sentry_dsn,
+    environment=settings.sentry_environment,
+    release=settings.sentry_release,
+    traces_sample_rate=settings.sentry_traces_sample_rate,
+)
 
 app = FastAPI(
     title="Chalna (찰나)",

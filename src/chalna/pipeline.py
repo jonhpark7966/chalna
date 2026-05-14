@@ -219,8 +219,8 @@ class ChalnaPipeline:
     ) -> Tuple[List[Segment], List[List[Segment]]]:
         """Run VibeVoice inference in chunks to avoid GPU OOM on long audio.
 
-        Splits audio into ~10min chunks, processes each sequentially,
-        and merges results with proper timestamp offsets.
+        Splits audio into overlapping chunks, processes each sequentially,
+        and keeps each segment in exactly one chunk based on its midpoint.
 
         Args:
             audio_path: Path to audio file
@@ -232,8 +232,10 @@ class ChalnaPipeline:
         Returns:
             (all_segments, per_chunk_segments) tuple
         """
-        CHUNK_DURATION = 600   # 10 minutes
-        MIN_TAIL = 120         # Merge tail if <2min remains
+        CHUNK_DURATION = 420   # 7 minutes
+        CHUNK_OVERLAP = 10     # Prevent boundary word loss
+        MIN_TAIL = 90          # Merge tail if <1.5min remains
+        CHUNK_STEP = CHUNK_DURATION - CHUNK_OVERLAP
 
         self._load_vibevoice()
 
@@ -249,10 +251,13 @@ class ChalnaPipeline:
             chunk_end = min(pos + CHUNK_DURATION, total_duration)
             if total_duration - chunk_end < MIN_TAIL:
                 chunk_end = total_duration
-            pos = chunk_end
+            pos = total_duration if chunk_end >= total_duration else pos + CHUNK_STEP
             total_chunks += 1
 
-        print(f"Chunked transcription: {total_duration:.0f}s audio → {total_chunks} chunks")
+        print(
+            f"Chunked transcription: {total_duration:.0f}s audio → {total_chunks} chunks "
+            f"({CHUNK_DURATION:.0f}s chunks, {CHUNK_OVERLAP:.0f}s overlap)"
+        )
 
         while current_start < total_duration:
             chunk_end = min(current_start + CHUNK_DURATION, total_duration)
@@ -283,24 +288,22 @@ class ChalnaPipeline:
                 seg.start_time += current_start
                 seg.end_time += current_start
 
-            # Determine incomplete segments at chunk boundary
-            # If last segment's end_time is very close to chunk_end, it may be cut off
-            if chunk_end < total_duration and chunk_segments:
-                last_seg = chunk_segments[-1]
-                if last_seg.end_time >= chunk_end - 1.0:
-                    # Drop incomplete segment - will be re-processed in next chunk
-                    print(f"    Dropping incomplete tail segment: "
-                          f"end={last_seg.end_time:.2f}s (chunk_end={chunk_end:.1f}s)")
-                    chunk_segments = chunk_segments[:-1]
+            # Keep only the non-overlap ownership window for this chunk.
+            # Boundary speech is present in both neighboring chunks; midpoint ownership
+            # avoids duplicate segments while preserving words near chunk cuts.
+            keep_start = 0.0 if current_start == 0 else current_start + (CHUNK_OVERLAP / 2)
+            keep_end = total_duration if chunk_end >= total_duration else chunk_end - (CHUNK_OVERLAP / 2)
+            kept_segments = []
+            dropped_overlap = 0
+            for seg in chunk_segments:
+                midpoint = (seg.start_time + seg.end_time) / 2
+                if keep_start <= midpoint < keep_end:
+                    kept_segments.append(seg)
+                else:
+                    dropped_overlap += 1
+            chunk_segments = kept_segments
 
-            # Determine next chunk start point
-            if chunk_end >= total_duration:
-                # Last chunk — always terminate regardless of segment coverage
-                next_start = total_duration
-            elif chunk_segments:
-                next_start = chunk_segments[-1].end_time
-            else:
-                next_start = chunk_end
+            next_start = total_duration if chunk_end >= total_duration else current_start + CHUNK_STEP
 
             # Store per-chunk results
             per_chunk.append(list(chunk_segments))
@@ -308,6 +311,8 @@ class ChalnaPipeline:
 
             print(f"    Got {len(chunk_segments)} segments, "
                   f"total so far: {len(all_segments)}")
+            if dropped_overlap:
+                print(f"    Dropped {dropped_overlap} overlap segment(s)")
 
             # Progress callback
             if progress_callback:

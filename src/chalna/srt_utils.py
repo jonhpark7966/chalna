@@ -21,13 +21,11 @@ def format_timestamp(seconds: float) -> str:
     Returns:
         Formatted timestamp string (e.g., "00:01:23,456")
     """
-    if seconds < 0:
-        seconds = 0
-
-    hours = int(seconds // 3600)
-    minutes = int((seconds % 3600) // 60)
-    secs = int(seconds % 60)
-    millis = int((seconds % 1) * 1000)
+    total_ms = round(max(seconds, 0) * 1000)
+    hours = total_ms // 3_600_000
+    minutes = (total_ms % 3_600_000) // 60_000
+    secs = (total_ms % 60_000) // 1000
+    millis = total_ms % 1000
 
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 

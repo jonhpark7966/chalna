@@ -26,12 +26,15 @@ from pydantic import BaseModel, Field
 from chalna import __version__
 from chalna.db import init_db, save_job as db_save_job, list_jobs as db_list_jobs, get_job as db_get_job, count_jobs as db_count_jobs, migrate_from_results_dir
 from chalna.exceptions import ChalnaError
+from chalna.monitoring import capture_job_exception, init_sentry
 from chalna.validation import validate_audio_file
 
 
 # =============================================================================
 # App Setup
 # =============================================================================
+
+init_sentry()
 
 app = FastAPI(
     title="Chalna (찰나)",
@@ -806,6 +809,7 @@ async def _queue_worker():
                 continue
             await _process_job(job_id=job_id, **params)
         except Exception as e:
+            capture_job_exception(e, job_id=job_id, context={"stage": "queue_worker"})
             job = _jobs.get(job_id)
             if job and job.status not in (JobStatus.COMPLETED, JobStatus.FAILED):
                 job.status = JobStatus.FAILED
@@ -958,6 +962,20 @@ async def _process_job(
         _save_job_to_db(job)
 
     except ChalnaError as e:
+        if e.http_status >= 500:
+            capture_job_exception(
+                e,
+                job_id=job_id,
+                context={
+                    "error_code": e.error_code.value,
+                    "error_type": e.__class__.__name__,
+                    "http_status": e.http_status,
+                    "audio_path": str(audio_path),
+                    "language": language,
+                    "use_alignment": use_alignment,
+                    "use_llm_refinement": use_llm_refinement,
+                },
+            )
         job.status = JobStatus.FAILED
         job.error = e.message
         job.error_details = {**e.to_dict(), "http_status": e.http_status}
@@ -965,6 +983,17 @@ async def _process_job(
         _save_job_to_db(job)
 
     except Exception as e:
+        capture_job_exception(
+            e,
+            job_id=job_id,
+            context={
+                "error_type": e.__class__.__name__,
+                "audio_path": str(audio_path),
+                "language": language,
+                "use_alignment": use_alignment,
+                "use_llm_refinement": use_llm_refinement,
+            },
+        )
         job.status = JobStatus.FAILED
         job.error = str(e)
         _save_job_error(job)

@@ -24,7 +24,6 @@ from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from chalna import __version__
-from chalna.context_builder import build_transcription_context
 from chalna.db import init_db, save_job as db_save_job, list_jobs as db_list_jobs, get_job as db_get_job, count_jobs as db_count_jobs, migrate_from_results_dir
 from chalna.exceptions import ChalnaError
 from chalna.monitoring import capture_job_exception, init_sentry
@@ -529,7 +528,7 @@ async def transcribe(
 
     _job_params[job_id] = dict(
         audio_path=tmp_path,
-        context=build_transcription_context(context),
+        context=context,
         language=language,
         include_speaker=include_speaker,
         use_alignment=use_alignment,
@@ -622,7 +621,7 @@ async def transcribe_async(
     # Enqueue for processing
     _job_params[job_id] = dict(
         audio_path=tmp_path,
-        context=build_transcription_context(context),
+        context=context,
         language=language,
         include_speaker=include_speaker,
         use_alignment=use_alignment,

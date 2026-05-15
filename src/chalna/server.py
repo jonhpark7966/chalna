@@ -407,6 +407,10 @@ class TranscriptionResultModel(BaseModel):
     metadata: MetadataModel
 
 
+class TranscriptionContextResponse(BaseModel):
+    context: str
+
+
 # =============================================================================
 # Endpoints
 # =============================================================================
@@ -442,6 +446,13 @@ async def health():
         models=models,
         gpu=gpu,
     )
+
+
+@app.get("/context/transcription", response_model=TranscriptionContextResponse)
+async def get_transcription_context():
+    """Return compact transcription context generated from curated SRT assets."""
+    context = build_transcription_context(None) or ""
+    return TranscriptionContextResponse(context=context)
 
 
 @app.post("/unload")
@@ -529,7 +540,7 @@ async def transcribe(
 
     _job_params[job_id] = dict(
         audio_path=tmp_path,
-        context=build_transcription_context(context),
+        context=context,
         language=language,
         include_speaker=include_speaker,
         use_alignment=use_alignment,
@@ -622,7 +633,7 @@ async def transcribe_async(
     # Enqueue for processing
     _job_params[job_id] = dict(
         audio_path=tmp_path,
-        context=build_transcription_context(context),
+        context=context,
         language=language,
         include_speaker=include_speaker,
         use_alignment=use_alignment,

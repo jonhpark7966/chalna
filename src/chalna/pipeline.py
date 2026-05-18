@@ -21,11 +21,21 @@ from chalna.exceptions import (
 )
 from chalna.models import IntermediateResults, Segment, TranscriptionMetadata, TranscriptionResult
 from chalna.settings import settings
+from chalna.subtitle_validator import has_repeated_token_loop, trim_repeated_token_tail
 from chalna.validation import (
     check_disk_space,
     estimate_temp_space_required,
     validate_audio_file,
 )
+
+ALIGNMENT_CONTEXT_PADDING_SECONDS = 2.0
+EDIT_BOUNDARY_PADDING_SECONDS = 0.15
+MIN_ALIGNED_DURATION_SECONDS = 0.05
+MIN_OUTPUT_SEGMENT_DURATION_SECONDS = 0.05
+MAX_RAW_SEGMENT_TEXT_CHARS = 1000
+MAX_RAW_SEGMENT_WORDS = 200
+EDIT_SAFE_MERGE_MAX_DURATION_SECONDS = 12.0
+EDIT_SAFE_MERGE_MAX_CHARS = 160
 
 
 class ChalnaPipeline:
@@ -116,6 +126,35 @@ class ChalnaPipeline:
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
 
+    @staticmethod
+    def _make_transformers_registration_idempotent() -> None:
+        """Allow vendored model modules to be imported more than once per process."""
+        from transformers.models.auto import AutoModel, AutoModelForCausalLM
+
+        for auto_cls in (AutoModel, AutoModelForCausalLM):
+            if getattr(auto_cls, "_chalna_register_idempotent", False):
+                continue
+
+            original_register = auto_cls.register.__func__
+
+            def register_idempotently(
+                cls,
+                config_class,
+                model_class,
+                exist_ok=False,
+                *,
+                _original_register=original_register,
+            ):
+                return _original_register(
+                    cls,
+                    config_class,
+                    model_class,
+                    exist_ok=True,
+                )
+
+            auto_cls.register = classmethod(register_idempotently)
+            auto_cls._chalna_register_idempotent = True
+
     def _load_vibevoice(self) -> None:
         """Load VibeVoice ASR model and processor."""
         if self._vibevoice_model is not None:
@@ -127,6 +166,8 @@ class ChalnaPipeline:
             vibevoice_path = Path(__file__).parent.parent.parent / "external" / "VibeVoice"
             if vibevoice_path.exists() and str(vibevoice_path) not in sys.path:
                 sys.path.insert(0, str(vibevoice_path))
+
+            self._make_transformers_registration_idempotent()
 
             from vibevoice.modular.modeling_vibevoice_asr import VibeVoiceASRForConditionalGeneration
             from vibevoice.processor.vibevoice_asr_processor import VibeVoiceASRProcessor
@@ -548,7 +589,10 @@ class ChalnaPipeline:
         # full keys ("Start time", "End time", "Speaker ID") depending on prompt
         segments = []
         for i, item in enumerate(api_segments, start=1):
-            text = item.get("Content", "")
+            text = self._clean_vibevoice_segment_text(item.get("Content", ""))
+            if not text:
+                continue
+
             # Skip environmental sounds and silence markers
             if text.startswith("[") and text.endswith("]"):
                 continue
@@ -572,6 +616,24 @@ class ChalnaPipeline:
             seg.index = i
 
         return segments
+
+    @staticmethod
+    def _clean_vibevoice_segment_text(text: str) -> str:
+        """Remove obvious VibeVoice repeated-token loops from a segment."""
+        cleaned = trim_repeated_token_tail(str(text or "").strip())
+        if not cleaned:
+            return ""
+
+        if has_repeated_token_loop(cleaned):
+            return ""
+
+        if (
+            len(cleaned) > MAX_RAW_SEGMENT_TEXT_CHARS
+            or len(cleaned.split()) > MAX_RAW_SEGMENT_WORDS
+        ):
+            return ""
+
+        return cleaned
 
     @staticmethod
     def _recover_truncated_json(content: str) -> Optional[list]:
@@ -813,6 +875,19 @@ class ChalnaPipeline:
                 self._refinement_log = [{"status": "skipped", "error": str(e)}]
             _progress("refining", 1.0)
 
+        segments = self._sanitize_segments_for_output(
+            segments,
+            verbose=verbose,
+            stage="final output",
+        )
+        segments = self._merge_tight_same_speaker_segments(
+            segments,
+            verbose=verbose,
+            stage="final output",
+        )
+        if not segments:
+            raise EmptyTranscriptionError(audio_duration=audio_info.duration_seconds)
+
         # Extract metadata
         speakers = list(set(s.speaker_id for s in segments if s.speaker_id))
         duration = max((s.end_time for s in segments), default=0.0)
@@ -904,6 +979,119 @@ class ChalnaPipeline:
             print("  " + "-" * 80)
 
         return self._run_alignment(audio_path, segments, verbose=verbose)
+
+    def validate_audio_boundaries(
+        self,
+        audio_path: str | Path,
+        segments: List[Segment],
+        *,
+        scan_padding: float = 0.5,
+        min_start_padding: float = 0.15,
+        min_end_padding: float = 0.15,
+        cutoff_tolerance: float = 0.03,
+        language: str = "Korean",
+    ) -> list:
+        """
+        Validate whether segment boundaries are too tight against spoken words.
+
+        This re-runs word-level alignment on a buffered audio window around each
+        segment. It is intentionally separate from transcribe() because it adds
+        one alignment pass per segment and is best used as an audit step.
+        """
+        audio_path = Path(audio_path)
+        if not audio_path.exists():
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+
+        self._load_aligner()
+        if not self._aligner:
+            raise RuntimeError("Qwen aligner is required for audio boundary validation")
+
+        from chalna.subtitle_validator import validate_audio_boundaries
+
+        return validate_audio_boundaries(
+            audio_path=audio_path,
+            segments=segments,
+            aligner=self._aligner,
+            scan_padding=scan_padding,
+            min_start_padding=min_start_padding,
+            min_end_padding=min_end_padding,
+            cutoff_tolerance=cutoff_tolerance,
+            language=language,
+        )
+
+    def _extract_alignment_audio_window(
+        self,
+        audio_path: Path,
+        original_start: float,
+        original_end: float,
+    ) -> tuple[Path, float, float]:
+        """Extract a buffered audio window for forced alignment."""
+        import subprocess
+
+        window_start = max(0.0, original_start - ALIGNMENT_CONTEXT_PADDING_SECONDS)
+        window_end = original_end + ALIGNMENT_CONTEXT_PADDING_SECONDS
+        window_duration = window_end - window_start
+
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                tmp_path = Path(tmp.name)
+        except OSError as e:
+            raise TempFileError(operation="create", cause=e)
+
+        try:
+            subprocess.run([
+                "ffmpeg", "-y",
+                "-ss", str(window_start),
+                "-i", str(audio_path),
+                "-t", str(window_duration),
+                "-vn",
+                "-acodec", "pcm_s16le",
+                "-ar", "16000",
+                "-ac", "1",
+                str(tmp_path),
+            ], capture_output=True, check=True)
+        except Exception:
+            tmp_path.unlink(missing_ok=True)
+            raise
+
+        return tmp_path, window_start, window_end
+
+    def _aligned_speech_bounds(
+        self,
+        words: list,
+        word_start_idx: int,
+        word_end_idx: int,
+        window_start: float,
+    ) -> tuple[float, float]:
+        """Convert word-relative alignment bounds to absolute speech bounds."""
+        start_idx = max(0, min(word_start_idx, len(words) - 1))
+        end_idx = max(start_idx, min(word_end_idx, len(words) - 1))
+        return (
+            window_start + words[start_idx].start_time,
+            window_start + words[end_idx].end_time,
+        )
+
+    def _apply_edit_boundary_padding(
+        self,
+        speech_start: float,
+        speech_end: float,
+        window_start: float,
+        window_end: float,
+    ) -> tuple[float, float]:
+        """Add edit padding around aligned speech, bounded by alignment context."""
+        padded_start = max(window_start, speech_start - EDIT_BOUNDARY_PADDING_SECONDS)
+        padded_end = min(window_end, speech_end + EDIT_BOUNDARY_PADDING_SECONDS)
+        return padded_start, padded_end
+
+    def _alignment_overlaps_original(
+        self,
+        speech_start: float,
+        speech_end: float,
+        original_start: float,
+        original_end: float,
+    ) -> bool:
+        """Reject matches that land completely outside the original segment."""
+        return speech_start < original_end and speech_end > original_start
 
     def _run_llm_refinement(
         self,
@@ -1049,6 +1237,11 @@ class ChalnaPipeline:
 
         # Step 3: Fix overlapping timestamps
         refined_segments = self._fix_overlapping_timestamps(refined_segments, verbose=verbose)
+        refined_segments = self._sanitize_segments_for_output(
+            refined_segments,
+            verbose=verbose,
+            stage="LLM refinement",
+        )
 
         # Re-index all segments
         for i, seg in enumerate(refined_segments, start=1):
@@ -1083,8 +1276,6 @@ class ChalnaPipeline:
         Returns:
             List of aligned Segment objects, or None if alignment fails
         """
-        import subprocess
-
         if not self._aligner:
             return None
 
@@ -1092,34 +1283,30 @@ class ChalnaPipeline:
         if original_duration < 0.1:
             return None
 
+        tmp_path = None
         try:
-            # Extract original segment audio
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                tmp_path = tmp.name
+            # Extract a buffered audio window so the aligner can recover speech
+            # that starts or ends slightly outside the original segment bounds.
+            tmp_path, window_start, window_end = self._extract_alignment_audio_window(
+                audio_path,
+                original_start,
+                original_end,
+            )
 
-            subprocess.run([
-                "ffmpeg", "-y",
-                "-ss", str(original_start),
-                "-i", str(audio_path),
-                "-t", str(original_duration),
-                "-vn",
-                "-acodec", "pcm_s16le",
-                "-ar", "16000",
-                "-ac", "1",
-                tmp_path,
-            ], capture_output=True, check=True)
+            tmp_path_str = str(tmp_path)
 
             # Combine all split texts for alignment
             combined_text = " ".join(split_texts)
 
             # Run word-level alignment on combined text
             results = self._aligner.align(
-                audio=tmp_path,
+                audio=tmp_path_str,
                 text=combined_text,
                 language="Korean",
             )
 
-            Path(tmp_path).unlink(missing_ok=True)
+            tmp_path.unlink(missing_ok=True)
+            tmp_path = None
 
             if not results or len(results) == 0 or len(results[0]) == 0:
                 return None
@@ -1128,7 +1315,6 @@ class ChalnaPipeline:
 
             # Find boundaries for each split text using character positions
             aligned_segments = []
-            current_char_pos = 0
             current_word_idx = 0
 
             for i, text in enumerate(split_texts):
@@ -1153,17 +1339,33 @@ class ChalnaPipeline:
                 if start_word_idx >= len(words):
                     break
 
-                # Get timestamps
-                start_time = original_start + words[start_word_idx].start_time
-                end_time = original_start + words[min(end_word_idx - 1, len(words) - 1)].end_time
+                speech_start, speech_end = self._aligned_speech_bounds(
+                    words,
+                    start_word_idx,
+                    min(end_word_idx - 1, len(words) - 1),
+                    window_start,
+                )
+
+                if not self._alignment_overlaps_original(
+                    speech_start,
+                    speech_end,
+                    original_start,
+                    original_end,
+                ):
+                    return None
 
                 # Ensure valid duration
-                if end_time <= start_time:
-                    end_time = start_time + 0.1
+                if speech_end <= speech_start:
+                    return None
 
-                # Clamp to original bounds
-                start_time = max(start_time, original_start)
-                end_time = min(end_time, original_end)
+                start_time, end_time = self._apply_edit_boundary_padding(
+                    speech_start,
+                    speech_end,
+                    window_start,
+                    window_end,
+                )
+                if end_time - start_time < MIN_ALIGNED_DURATION_SECONDS:
+                    return None
 
                 aligned_segments.append(Segment(
                     index=i + 1,  # Will be re-indexed later
@@ -1176,9 +1378,14 @@ class ChalnaPipeline:
 
                 current_word_idx = end_word_idx
 
-            return aligned_segments if aligned_segments else None
+            if not aligned_segments:
+                return None
+
+            return self._fix_overlapping_timestamps(aligned_segments, verbose=False)
 
         except Exception:
+            if tmp_path is not None:
+                tmp_path.unlink(missing_ok=True)
             return None
 
     def _align_single_segment(
@@ -1196,8 +1403,6 @@ class ChalnaPipeline:
         Returns:
             Aligned segment or None if alignment fails
         """
-        import subprocess
-
         if not self._aligner:
             return None
 
@@ -1208,31 +1413,25 @@ class ChalnaPipeline:
         if original_duration < 0.1:
             return None
 
+        tmp_path = None
         try:
-            # Extract segment audio
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                tmp_path = tmp.name
-
-            subprocess.run([
-                "ffmpeg", "-y",
-                "-ss", str(original_start),
-                "-i", str(audio_path),
-                "-t", str(original_duration),
-                "-vn",
-                "-acodec", "pcm_s16le",
-                "-ar", "16000",
-                "-ac", "1",
-                tmp_path,
-            ], capture_output=True, check=True)
+            # Extract a buffered audio window so re-alignment may expand
+            # slightly when the original segment clipped speech.
+            tmp_path, window_start, window_end = self._extract_alignment_audio_window(
+                audio_path,
+                original_start,
+                original_end,
+            )
 
             # Run alignment
             results = self._aligner.align(
-                audio=tmp_path,
+                audio=str(tmp_path),
                 text=segment.text,
                 language="Korean",
             )
 
-            Path(tmp_path).unlink(missing_ok=True)
+            tmp_path.unlink(missing_ok=True)
+            tmp_path = None
 
             if not results or len(results) == 0 or len(results[0]) == 0:
                 return None
@@ -1240,16 +1439,29 @@ class ChalnaPipeline:
             first_item = results[0][0]
             last_item = results[0][-1]
 
-            new_start = original_start + first_item.start_time
-            new_end = original_start + last_item.end_time
+            speech_start = window_start + first_item.start_time
+            speech_end = window_start + last_item.end_time
 
-            # Validate duration
-            if new_end - new_start < 0.05:
+            if not self._alignment_overlaps_original(
+                speech_start,
+                speech_end,
+                original_start,
+                original_end,
+            ):
                 return None
 
-            # Tighten to original bounds
-            new_start = max(new_start, original_start)
-            new_end = min(new_end, original_end)
+            # Validate duration
+            if speech_end - speech_start < MIN_ALIGNED_DURATION_SECONDS:
+                return None
+
+            new_start, new_end = self._apply_edit_boundary_padding(
+                speech_start,
+                speech_end,
+                window_start,
+                window_end,
+            )
+            if new_end - new_start < MIN_ALIGNED_DURATION_SECONDS:
+                return None
 
             return Segment(
                 index=segment.index,
@@ -1261,6 +1473,8 @@ class ChalnaPipeline:
             )
 
         except Exception:
+            if tmp_path is not None:
+                tmp_path.unlink(missing_ok=True)
             return None
 
     def _split_into_sentences(self, text: str) -> List[str]:
@@ -1486,16 +1700,13 @@ class ChalnaPipeline:
 
         Strategy:
         1. For each segment, detect sentence boundaries
-        2. Run word-level forced alignment
+        2. Run word-level forced alignment with 2s audio context on both sides
         3. Split multi-sentence segments using word timestamps
-        4. Apply tighten-only constraint for timestamp refinement
+        4. Add edit padding around aligned speech boundaries
         5. If alignment fails, keep original segment
         """
-        import subprocess
-
         aligned_segments = []
         alignment_log = []
-        segment_index = 1  # Will be reassigned after processing
 
         for seg in segments:
             if not seg.text.strip():
@@ -1511,29 +1722,17 @@ class ChalnaPipeline:
                 aligned_segments.append(seg)
                 continue
 
+            tmp_path = None
             try:
-                # Extract exact segment audio (no buffer)
-                try:
-                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                        tmp_path = tmp.name
-                except OSError as e:
-                    raise TempFileError(operation="create", cause=e)
-
-                subprocess.run([
-                    "ffmpeg", "-y",
-                    "-ss", str(original_start),
-                    "-i", str(audio_path),
-                    "-t", str(original_duration),
-                    "-vn",
-                    "-acodec", "pcm_s16le",
-                    "-ar", "16000",
-                    "-ac", "1",
-                    tmp_path,
-                ], capture_output=True, check=True)
+                tmp_path, window_start, window_end = self._extract_alignment_audio_window(
+                    audio_path,
+                    original_start,
+                    original_end,
+                )
 
                 # Run alignment
                 results = self._aligner.align(
-                    audio=tmp_path,
+                    audio=str(tmp_path),
                     text=seg.text,
                     language="Korean",
                 )
@@ -1550,7 +1749,8 @@ class ChalnaPipeline:
                     alignment_log.append(log_entry)
                     if verbose:
                         print(f"  [{seg.index:3d}] No alignment result - keeping original")
-                    Path(tmp_path).unlink(missing_ok=True)
+                    tmp_path.unlink(missing_ok=True)
+                    tmp_path = None
                     continue
 
                 # Split into sentences
@@ -1562,28 +1762,37 @@ class ChalnaPipeline:
                     first_item = results[0][0]
                     last_item = results[0][-1]
 
-                    new_start = original_start + first_item.start_time
-                    new_end = original_start + last_item.end_time
+                    speech_start = window_start + first_item.start_time
+                    speech_end = window_start + last_item.end_time
 
-                    aligned_duration = new_end - new_start
-                    if aligned_duration < 0.1:
+                    aligned_duration = speech_end - speech_start
+                    if aligned_duration < MIN_ALIGNED_DURATION_SECONDS:
                         aligned_segments.append(seg)
                         log_entry = {
                             "index": seg.index,
                             "status": "invalid_duration",
                             "original": {"start": original_start, "end": original_end},
-                            "attempted": {"start": new_start, "end": new_end},
+                            "attempted": {"start": speech_start, "end": speech_end},
                             "text": seg.text[:50] + "..." if len(seg.text) > 50 else seg.text,
                         }
                         alignment_log.append(log_entry)
                         if verbose:
                             print(f"  [{seg.index:3d}] INVALID: duration={aligned_duration:.2f}s - keeping original")
                     else:
-                        # Tighten-only check
-                        start_tighter = new_start >= original_start - 0.01
-                        end_tighter = new_end <= original_end + 0.01
+                        overlaps_original = self._alignment_overlaps_original(
+                            speech_start,
+                            speech_end,
+                            original_start,
+                            original_end,
+                        )
 
-                        if start_tighter and end_tighter:
+                        if overlaps_original:
+                            new_start, new_end = self._apply_edit_boundary_padding(
+                                speech_start,
+                                speech_end,
+                                window_start,
+                                window_end,
+                            )
                             delta_start = new_start - original_start
                             delta_end = new_end - original_end
 
@@ -1601,6 +1810,7 @@ class ChalnaPipeline:
                                 "status": "aligned",
                                 "original": {"start": original_start, "end": original_end},
                                 "aligned": {"start": new_start, "end": new_end},
+                                "speech": {"start": speech_start, "end": speech_end},
                                 "delta": {"start": delta_start, "end": delta_end},
                                 "text": seg.text[:50] + "..." if len(seg.text) > 50 else seg.text,
                             }
@@ -1613,18 +1823,16 @@ class ChalnaPipeline:
                             aligned_segments.append(seg)
                             log_entry = {
                                 "index": seg.index,
-                                "status": "rejected_expand",
+                                "status": "rejected_no_overlap",
                                 "original": {"start": original_start, "end": original_end},
-                                "attempted": {"start": new_start, "end": new_end},
+                                "attempted": {"start": speech_start, "end": speech_end},
                                 "text": seg.text[:50] + "..." if len(seg.text) > 50 else seg.text,
                             }
                             alignment_log.append(log_entry)
 
                             if verbose:
-                                delta_s = new_start - original_start
-                                delta_e = new_end - original_end
-                                print(f"  [{seg.index:3d}] REJECTED: would expand "
-                                      f"(start {delta_s:+.2f}s, end {delta_e:+.2f}s) - keeping original")
+                                print(f"  [{seg.index:3d}] REJECTED: alignment outside "
+                                      "original segment - keeping original")
                 else:
                     # Multiple sentences - find boundaries and split
                     boundaries = self._find_sentence_boundaries(results, sentences, seg.text)
@@ -1652,16 +1860,27 @@ class ChalnaPipeline:
 
                         for i, (rel_start, rel_end, sentence_text) in enumerate(boundaries):
                             # Convert to absolute timestamps
-                            abs_start = original_start + rel_start
-                            abs_end = original_start + rel_end
+                            speech_start = window_start + rel_start
+                            speech_end = window_start + rel_end
 
                             # Validate duration
-                            if abs_end - abs_start < 0.05:
+                            if speech_end - speech_start < MIN_ALIGNED_DURATION_SECONDS:
                                 continue
 
-                            # Tighten to original bounds
-                            abs_start = max(abs_start, original_start)
-                            abs_end = min(abs_end, original_end)
+                            if not self._alignment_overlaps_original(
+                                speech_start,
+                                speech_end,
+                                original_start,
+                                original_end,
+                            ):
+                                continue
+
+                            abs_start, abs_end = self._apply_edit_boundary_padding(
+                                speech_start,
+                                speech_end,
+                                window_start,
+                                window_end,
+                            )
 
                             new_seg = Segment(
                                 index=seg.index,  # Will be re-indexed later
@@ -1680,6 +1899,7 @@ class ChalnaPipeline:
                                 "split_total": len(boundaries),
                                 "original": {"start": original_start, "end": original_end},
                                 "aligned": {"start": abs_start, "end": abs_end},
+                                "speech": {"start": speech_start, "end": speech_end},
                                 "text": sentence_text[:50] + "..." if len(sentence_text) > 50 else sentence_text,
                             }
                             alignment_log.append(log_entry)
@@ -1689,9 +1909,12 @@ class ChalnaPipeline:
                                       f"{sentence_text[:40]}{'...' if len(sentence_text) > 40 else ''}")
 
                 # Cleanup
-                Path(tmp_path).unlink(missing_ok=True)
+                tmp_path.unlink(missing_ok=True)
+                tmp_path = None
 
             except Exception as e:
+                if tmp_path is not None:
+                    tmp_path.unlink(missing_ok=True)
                 aligned_segments.append(seg)
                 log_entry = {
                     "index": seg.index,
@@ -1707,6 +1930,11 @@ class ChalnaPipeline:
 
         # Fix overlapping timestamps using midpoint interpolation
         aligned_segments = self._fix_overlapping_timestamps(aligned_segments, verbose=verbose)
+        aligned_segments = self._sanitize_segments_for_output(
+            aligned_segments,
+            verbose=verbose,
+            stage="forced alignment",
+        )
 
         # Re-index all segments
         for i, seg in enumerate(aligned_segments, start=1):
@@ -1729,6 +1957,8 @@ class ChalnaPipeline:
         - Calculate midpoint = (end_time + start_time) / 2
         - Set segment N's end_time = midpoint
         - Set segment N+1's start_time = midpoint
+
+        This also fairly shares any conflict introduced by edit boundary padding.
         """
         if len(segments) <= 1:
             return segments
@@ -1752,3 +1982,121 @@ class ChalnaPipeline:
             print(f"\n  Fixed {fixed_count} overlapping timestamp(s) using midpoint interpolation")
 
         return segments
+
+    def _sanitize_segments_for_output(
+        self,
+        segments: List[Segment],
+        *,
+        verbose: bool = True,
+        stage: str = "segments",
+    ) -> List[Segment]:
+        """
+        Drop segments that cannot be represented as valid edit-safe subtitle spans.
+
+        This is intentionally conservative: hallucinated repeated-token loops and
+        non-positive timestamp spans should never reach final SRT output.
+        """
+        sanitized: List[Segment] = []
+        dropped_invalid_time = 0
+        dropped_text_quality = 0
+        adjusted_overlaps = 0
+
+        for segment in segments:
+            text = trim_repeated_token_tail(segment.text.strip())
+            if (
+                not text
+                or has_repeated_token_loop(text)
+                or len(text) > MAX_RAW_SEGMENT_TEXT_CHARS
+                or len(text.split()) > MAX_RAW_SEGMENT_WORDS
+            ):
+                dropped_text_quality += 1
+                continue
+
+            start_time = max(0.0, float(segment.start_time))
+            end_time = max(0.0, float(segment.end_time))
+            if end_time - start_time < MIN_OUTPUT_SEGMENT_DURATION_SECONDS:
+                dropped_invalid_time += 1
+                continue
+
+            if sanitized and start_time < sanitized[-1].end_time:
+                previous_end = sanitized[-1].end_time
+                if end_time - previous_end < MIN_OUTPUT_SEGMENT_DURATION_SECONDS:
+                    dropped_invalid_time += 1
+                    continue
+                start_time = previous_end
+                adjusted_overlaps += 1
+
+            sanitized.append(Segment(
+                index=len(sanitized) + 1,
+                start_time=start_time,
+                end_time=end_time,
+                text=text,
+                speaker_id=segment.speaker_id,
+                confidence=segment.confidence,
+            ))
+
+        if verbose and (dropped_invalid_time or dropped_text_quality or adjusted_overlaps):
+            print(
+                f"  Sanitized {stage}: "
+                f"dropped {dropped_invalid_time} invalid timestamp segment(s), "
+                f"dropped {dropped_text_quality} repeated/oversized text segment(s), "
+                f"adjusted {adjusted_overlaps} residual overlap(s)"
+            )
+
+        return sanitized
+
+    def _merge_tight_same_speaker_segments(
+        self,
+        segments: List[Segment],
+        *,
+        verbose: bool = True,
+        stage: str = "segments",
+    ) -> List[Segment]:
+        """Merge adjacent same-speaker segments that cannot both carry edit padding."""
+        if len(segments) <= 1:
+            return segments
+
+        merged: List[Segment] = []
+        merge_count = 0
+
+        for segment in segments:
+            if merged and self._can_merge_for_edit_safety(merged[-1], segment):
+                previous = merged[-1]
+                previous.end_time = max(previous.end_time, segment.end_time)
+                previous.text = f"{previous.text.rstrip()} {segment.text.lstrip()}".strip()
+                previous.confidence = min(previous.confidence, segment.confidence)
+                merge_count += 1
+                continue
+
+            merged.append(Segment(
+                index=len(merged) + 1,
+                start_time=segment.start_time,
+                end_time=segment.end_time,
+                text=segment.text,
+                speaker_id=segment.speaker_id,
+                confidence=segment.confidence,
+            ))
+
+        for index, segment in enumerate(merged, start=1):
+            segment.index = index
+
+        if verbose and merge_count:
+            print(f"  Merged {merge_count} tight same-speaker segment(s) in {stage}")
+
+        return merged
+
+    @staticmethod
+    def _can_merge_for_edit_safety(previous: Segment, current: Segment) -> bool:
+        if previous.speaker_id != current.speaker_id:
+            return False
+
+        gap = current.start_time - previous.end_time
+        if gap < -0.001 or gap >= EDIT_BOUNDARY_PADDING_SECONDS:
+            return False
+
+        merged_duration = current.end_time - previous.start_time
+        if merged_duration > EDIT_SAFE_MERGE_MAX_DURATION_SECONDS:
+            return False
+
+        merged_text = f"{previous.text.rstrip()} {current.text.lstrip()}".strip()
+        return len(merged_text) <= EDIT_SAFE_MERGE_MAX_CHARS

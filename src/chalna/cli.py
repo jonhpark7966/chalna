@@ -433,6 +433,185 @@ def transcribe(
         raise typer.Exit(code=1)
 
 
+@app.command("validate-boundaries")
+def validate_boundaries(
+    audio_file: Path = typer.Argument(
+        ...,
+        help="Source audio/video file path",
+        exists=True,
+        readable=True,
+    ),
+    subtitles: Path = typer.Argument(
+        ...,
+        help="SRT file to validate against the source audio",
+        exists=True,
+        readable=True,
+    ),
+    output: Optional[Path] = typer.Option(
+        None,
+        "-o",
+        "--output",
+        help="Optional JSON report output path",
+    ),
+    scan_padding: float = typer.Option(
+        0.5,
+        "--scan-padding",
+        help="Seconds of audio context to align before and after each segment",
+    ),
+    min_start_padding: float = typer.Option(
+        0.15,
+        "--min-start-padding",
+        help="Minimum acceptable seconds before the first aligned word",
+    ),
+    min_end_padding: float = typer.Option(
+        0.15,
+        "--min-end-padding",
+        help="Minimum acceptable seconds after the last aligned word",
+    ),
+    cutoff_tolerance: float = typer.Option(
+        0.03,
+        "--cutoff-tolerance",
+        help="Seconds of tolerance before reporting speech cutoff instead of tightness",
+    ),
+    language: str = typer.Option(
+        "Korean",
+        "--alignment-language",
+        help="Language name passed to the Qwen forced aligner",
+    ),
+    device: str = typer.Option(
+        "auto",
+        "--device",
+        help="Device to use (cuda, cpu, mps, xpu, auto)",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Print the full JSON report to stdout",
+    ),
+    fail_on_issue: bool = typer.Option(
+        False,
+        "--fail-on-issue",
+        help="Exit with code 2 when warning/error issues are found",
+    ),
+    verbose: bool = typer.Option(
+        False,
+        "-v",
+        "--verbose",
+        help="Show detailed exception logs",
+    ),
+):
+    """
+    Validate whether SRT segment boundaries are too tight for edit use.
+
+    The command re-aligns each subtitle with neighboring subtitle context and
+    reports starts/ends that sit too close to the target segment's spoken words.
+    """
+    import json as json_module
+
+    from chalna.models import Segment
+    from chalna.pipeline import ChalnaPipeline
+    from chalna.srt_utils import parse_srt
+    from chalna.subtitle_validator import summarize_validation_diagnostics, validate_segments
+
+    parsed_segments = parse_srt(subtitles.read_text(encoding="utf-8"))
+    segments = [
+        Segment(
+            index=item["index"],
+            start_time=item["start_time"],
+            end_time=item["end_time"],
+            text=item["text"],
+            speaker_id=item.get("speaker_id"),
+        )
+        for item in parsed_segments
+    ]
+
+    if not segments:
+        console.print(f"[bold red]Error:[/bold red] No SRT segments found in {subtitles}")
+        raise typer.Exit(code=1)
+
+    contract_issues = validate_segments(segments)
+
+    pipeline = ChalnaPipeline(
+        device=device,
+        use_alignment=True,
+        use_llm_refinement=False,
+    )
+
+    try:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+        ) as progress:
+            task = progress.add_task("Validating subtitle boundaries...", total=None)
+            audio_issues = pipeline.validate_audio_boundaries(
+                audio_path=audio_file,
+                segments=segments,
+                scan_padding=scan_padding,
+                min_start_padding=min_start_padding,
+                min_end_padding=min_end_padding,
+                cutoff_tolerance=cutoff_tolerance,
+                language=language,
+            )
+            issues = contract_issues + audio_issues
+            progress.update(task, description="Boundary validation complete")
+    except Exception as e:
+        console.print(f"[bold red]Error:[/bold red] {e}")
+        if verbose:
+            console.print_exception()
+        raise typer.Exit(code=1)
+    finally:
+        pipeline.unload(force=True)
+
+    report = {
+        "audio_file": str(audio_file),
+        "subtitles": str(subtitles),
+        "segments_checked": len(segments),
+        "passed": not any(issue.severity in {"warning", "error"} for issue in issues),
+        "thresholds": {
+            "scan_padding": scan_padding,
+            "min_start_padding": min_start_padding,
+            "min_end_padding": min_end_padding,
+            "cutoff_tolerance": cutoff_tolerance,
+        },
+        "diagnostics": summarize_validation_diagnostics(segments, issues),
+        "issues": [issue.to_dict() for issue in issues],
+    }
+    report_json = json_module.dumps(report, ensure_ascii=False, indent=2)
+
+    if output:
+        output.write_text(report_json, encoding="utf-8")
+
+    if json_output:
+        console.print(report_json)
+    else:
+        console.print()
+        console.print("[bold blue]Boundary validation[/bold blue]")
+        console.print(f"  Segments checked: {len(segments)}")
+        console.print(f"  Issues: {len(issues)}")
+        diagnostics = report["diagnostics"]
+        console.print(
+            "  Diagnostics: "
+            f"zero-gap={diagnostics['gap']['zero_gap']}, "
+            f"same-speaker zero-gap={diagnostics['gap']['same_speaker_zero_gap']}, "
+            f"low-match={diagnostics['alignment']['low_target_match_ratio_lt_0_7']}"
+        )
+        if output:
+            console.print(f"  Report: {output}")
+
+        for issue in issues[:20]:
+            console.print(
+                f"  [{issue.severity}] #{issue.segment_index} {issue.code}: "
+                f"{issue.start_time:.2f}s→{issue.end_time:.2f}s"
+            )
+
+        if len(issues) > 20:
+            console.print(f"  ... {len(issues) - 20} more issue(s)")
+
+    if fail_on_issue and not report["passed"]:
+        raise typer.Exit(code=2)
+
+
 @app.command()
 def serve(
     host: str = typer.Option(

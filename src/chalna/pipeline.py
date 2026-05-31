@@ -547,7 +547,7 @@ class ChalnaPipeline:
         context: Optional[str] = None,
         max_new_tokens: int = 32768,
         min_gap_seconds: float = 2.0,
-        max_passes: int = 5,
+        max_passes: Optional[int] = None,
     ) -> List[Segment]:
         """Re-transcribe trailing audio that VibeVoice skipped via an early EOS.
 
@@ -558,6 +558,10 @@ class ChalnaPipeline:
         the remaining tail, transcribe it as a fresh call, offset its timestamps,
         and repeat until the audio is covered or no progress is made.
         """
+        if max_passes is None:
+            # Scale with duration: each pass may only recover ~10-30s after an early
+            # EOS, so long clips need many passes to be fully covered.
+            max_passes = max(5, int(duration / 10) + 2)
         for _ in range(max_passes):
             last_end = segments[-1].end_time if segments else 0.0
             remaining = duration - last_end

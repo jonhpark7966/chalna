@@ -39,7 +39,7 @@ class RefinementOutput:
 def call_codex_cli(
     prompt: str,
     model: str = "gpt-5.5",
-    reasoning_effort: str = "medium",
+    reasoning_effort: str = "xhigh",
     timeout: int = 120,
 ) -> str:
     """
@@ -50,7 +50,7 @@ def call_codex_cli(
     Args:
         prompt: The prompt to send
         model: Model to use (default: gpt-5.5)
-        reasoning_effort: Reasoning effort level (minimal/low/medium/high/xhigh)
+        reasoning_effort: Reasoning effort level (minimal/low/medium/high/xhigh; default: xhigh)
         timeout: Timeout in seconds
 
     Returns:
@@ -65,6 +65,7 @@ def call_codex_cli(
             [
                 "codex",
                 "exec",
+                "--skip-git-repo-check",  # /app is not a git repo inside the container
                 "-m", model,
                 "-c", f"model_reasoning_effort={reasoning_effort}",
                 "-",  # Read prompt from stdin

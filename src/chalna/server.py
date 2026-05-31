@@ -419,6 +419,22 @@ class DoctorResponse(BaseModel):
     checks: List[DoctorCheck]
 
 
+class TranslateSegmentIO(BaseModel):
+    index: int
+    text: str
+
+
+class TranslateRequest(BaseModel):
+    segments: List[TranslateSegmentIO]
+    target_language: str
+    source_language: Optional[str] = None
+
+
+class TranslateResponse(BaseModel):
+    translations: List[TranslateSegmentIO]
+    target_language: str
+
+
 # =============================================================================
 # Endpoints
 # =============================================================================
@@ -527,6 +543,30 @@ async def doctor():
     has_optional_failure = any((not c.critical) and not c.ok for c in checks)
     status = "error" if has_critical_failure else ("degraded" if has_optional_failure else "ok")
     return DoctorResponse(status=status, version=__version__, checks=checks)
+
+
+@app.post("/translate", response_model=TranslateResponse)
+async def translate(req: TranslateRequest):
+    """
+    Translate segments to a target language (length-aware, for dubbing) via Codex CLI.
+
+    Requires the codex CLI to be available (see /doctor). Returns one translation
+    per input segment, preserving indices.
+    """
+    from chalna.translator import translate_segments
+
+    try:
+        out = translate_segments(
+            [s.model_dump() for s in req.segments],
+            source_language=req.source_language,
+            target_language=req.target_language,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"translation failed: {e}")
+    return TranslateResponse(
+        translations=[TranslateSegmentIO(**t) for t in out],
+        target_language=req.target_language,
+    )
 
 
 @app.post("/unload")

@@ -539,6 +539,58 @@ class ChalnaPipeline:
 
         return all_segments
 
+    def _ensure_full_coverage(
+        self,
+        audio_path: Path,
+        duration: float,
+        segments: List[Segment],
+        context: Optional[str] = None,
+        max_new_tokens: int = 32768,
+        min_gap_seconds: float = 2.0,
+        max_passes: int = 5,
+    ) -> List[Segment]:
+        """Re-transcribe trailing audio that VibeVoice skipped via an early EOS.
+
+        VibeVoice sometimes emits EOS partway through a clip, dropping the rest
+        even though that tail transcribes fine in isolation (the built-in
+        continuation only handles max_new_tokens truncation, not early EOS). After
+        the main pass, if the last segment ends well before the audio does, slice
+        the remaining tail, transcribe it as a fresh call, offset its timestamps,
+        and repeat until the audio is covered or no progress is made.
+        """
+        for _ in range(max_passes):
+            last_end = segments[-1].end_time if segments else 0.0
+            remaining = duration - last_end
+            if remaining <= min_gap_seconds:
+                break
+
+            tail_path = self._extract_audio_chunk(audio_path, last_end, remaining)
+            try:
+                tail_segments = self._call_vibevoice(tail_path, remaining, context, max_new_tokens)
+            finally:
+                tail_path.unlink(missing_ok=True)
+
+            if not tail_segments:
+                break
+
+            for seg in tail_segments:
+                seg.start_time += last_end
+                seg.end_time += last_end
+
+            # No forward progress -> stop (avoid an infinite re-transcribe loop)
+            if tail_segments[-1].end_time <= last_end + 0.05:
+                break
+
+            print(
+                f"  Coverage gap: re-transcribed tail from {last_end:.2f}s, "
+                f"+{len(tail_segments)} segments"
+            )
+            segments.extend(tail_segments)
+
+        for i, seg in enumerate(segments, start=1):
+            seg.index = i
+        return segments
+
     def _parse_vibevoice_response(self, content: str) -> List[Segment]:
         """Parse VibeVoice vLLM response content into Segment objects.
 
@@ -792,6 +844,11 @@ class ChalnaPipeline:
             else:
                 segments = self._call_vibevoice(
                     audio_path, audio_info.duration_seconds, context, max_new_tokens
+                )
+                # VibeVoice can emit an early EOS mid-clip and drop the tail;
+                # re-transcribe any uncovered trailing audio (model stays loaded).
+                segments = self._ensure_full_coverage(
+                    audio_path, audio_info.duration_seconds, segments, context, max_new_tokens
                 )
         finally:
             # Always unload VibeVoice to free GPU (even on error)

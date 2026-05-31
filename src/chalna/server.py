@@ -406,6 +406,19 @@ class TranscriptionResultModel(BaseModel):
     metadata: MetadataModel
 
 
+class DoctorCheck(BaseModel):
+    name: str
+    ok: bool
+    critical: bool = True
+    detail: Optional[str] = None
+
+
+class DoctorResponse(BaseModel):
+    status: str  # "ok" | "degraded" | "error"
+    version: str
+    checks: List[DoctorCheck]
+
+
 # =============================================================================
 # Endpoints
 # =============================================================================
@@ -441,6 +454,79 @@ async def health():
         models=models,
         gpu=gpu,
     )
+
+
+def _run_doctor_checks() -> List[DoctorCheck]:
+    """Inspect external tools, GPU/torch, and model config.
+
+    Critical checks failing -> status "error"; only non-critical failing ->
+    "degraded". `codex` is non-critical (transcription works without it) but its
+    absence silently disables LLM refinement / translation, so it is reported loudly.
+    """
+    import shutil
+    import subprocess as _sp
+
+    checks: List[DoctorCheck] = []
+
+    # codex CLI — LLM refinement (and target-language translation)
+    codex_path = shutil.which("codex")
+    if codex_path:
+        ver = None
+        try:
+            r = _sp.run(["codex", "--version"], capture_output=True, text=True, timeout=10)
+            if r.returncode == 0:
+                ver = (r.stdout or r.stderr).strip().splitlines()[0]
+        except Exception:
+            ver = None
+        checks.append(DoctorCheck(name="codex", ok=True, critical=False,
+                                  detail=f"{codex_path} ({ver})" if ver else codex_path))
+    else:
+        checks.append(DoctorCheck(name="codex", ok=False, critical=False,
+                                  detail="codex CLI not found on PATH — LLM refinement/translation disabled"))
+
+    # ffmpeg — audio/video decoding
+    ff = shutil.which("ffmpeg")
+    checks.append(DoctorCheck(name="ffmpeg", ok=bool(ff), critical=True,
+                              detail=ff or "ffmpeg not found on PATH"))
+
+    # torch + CUDA
+    try:
+        import torch
+        cuda = torch.cuda.is_available()
+        dev = torch.cuda.get_device_name(0) if cuda else None
+        checks.append(DoctorCheck(name="torch", ok=True, critical=True, detail=f"torch {torch.__version__}"))
+        checks.append(DoctorCheck(name="gpu", ok=cuda, critical=True, detail=dev or "CUDA not available"))
+    except Exception as e:
+        checks.append(DoctorCheck(name="torch", ok=False, critical=True, detail=f"{type(e).__name__}: {e}"))
+        checks.append(DoctorCheck(name="gpu", ok=False, critical=True, detail="torch import failed"))
+
+    # transformers
+    try:
+        import transformers
+        checks.append(DoctorCheck(name="transformers", ok=True, critical=True,
+                                  detail=f"transformers {transformers.__version__}"))
+    except Exception as e:
+        checks.append(DoctorCheck(name="transformers", ok=False, critical=True, detail=f"{type(e).__name__}: {e}"))
+
+    # model configuration (loadability is verified lazily at transcribe time)
+    checks.append(DoctorCheck(name="vibevoice_model", ok=True, critical=False,
+                              detail=settings.vibevoice_model_path))
+
+    return checks
+
+
+@app.get("/doctor", response_model=DoctorResponse)
+async def doctor():
+    """
+    Diagnose the runtime setup: external tools (codex, ffmpeg), GPU/torch,
+    and model configuration. Surfaces environment issues that /health does not
+    (e.g. a missing codex CLI that silently disables LLM refinement/translation).
+    """
+    checks = _run_doctor_checks()
+    has_critical_failure = any(c.critical and not c.ok for c in checks)
+    has_optional_failure = any((not c.critical) and not c.ok for c in checks)
+    status = "error" if has_critical_failure else ("degraded" if has_optional_failure else "ok")
+    return DoctorResponse(status=status, version=__version__, checks=checks)
 
 
 @app.post("/unload")

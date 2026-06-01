@@ -18,7 +18,9 @@ COPY pyproject.toml README.md /app/
 COPY external /app/external
 
 RUN python -m pip install --upgrade pip setuptools wheel \
-    && pip install -e /app/external/VibeVoice
+    && pip install -e /app/external/VibeVoice \
+    && pip install -e /app/external/Qwen3-ASR   # Qwen forced aligner (qwen_asr); without it,
+    #                                             alignment is skipped and refinement splits are dropped
 
 COPY src /app/src
 

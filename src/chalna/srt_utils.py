@@ -5,7 +5,7 @@ SRT subtitle utilities.
 from __future__ import annotations
 
 import re
-from typing import List, TYPE_CHECKING
+from typing import TYPE_CHECKING, List
 
 if TYPE_CHECKING:
     from chalna.models import Segment
@@ -21,11 +21,13 @@ def format_timestamp(seconds: float) -> str:
     Returns:
         Formatted timestamp string (e.g., "00:01:23,456")
     """
-    total_ms = round(max(seconds, 0) * 1000)
-    hours = total_ms // 3_600_000
-    minutes = (total_ms % 3_600_000) // 60_000
-    secs = (total_ms % 60_000) // 1000
-    millis = total_ms % 1000
+    if seconds < 0:
+        seconds = 0
+
+    total_millis = int(round(seconds * 1000))
+    total_seconds, millis = divmod(total_millis, 1000)
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
 
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 

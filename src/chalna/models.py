@@ -9,6 +9,26 @@ from typing import List, Optional
 
 
 @dataclass
+class ScribeOptions:
+    """Options forwarded to ElevenLabs Scribe."""
+
+    diarize: bool = True
+    tag_audio_events: bool = True
+    num_speakers: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if self.num_speakers is not None and not 1 <= self.num_speakers <= 32:
+            raise ValueError("num_speakers must be between 1 and 32")
+
+    def to_dict(self) -> dict:
+        return {
+            "diarize": self.diarize,
+            "tag_audio_events": self.tag_audio_events,
+            "num_speakers": self.num_speakers,
+        }
+
+
+@dataclass
 class Segment:
     """A single transcription segment."""
 
@@ -41,12 +61,13 @@ class TranscriptionMetadata:
     duration: float  # total audio duration in seconds
     language: Optional[str] = None
     speakers: List[str] = field(default_factory=list)
-    model_version: str = "vibevoice-asr"
-    aligned: bool = True  # whether Qwen alignment was applied
+    model_version: str = "scribe_v2"
+    aligned: bool = False  # whether external forced alignment was applied
     refined: bool = True  # whether LLM refinement was applied
+    timestamp_source: Optional[str] = None
 
     def to_dict(self) -> dict:
-        return {
+        result = {
             "duration": self.duration,
             "language": self.language,
             "speakers": self.speakers,
@@ -54,17 +75,20 @@ class TranscriptionMetadata:
             "aligned": self.aligned,
             "refined": self.refined,
         }
+        if self.timestamp_source is not None:
+            result["timestamp_source"] = self.timestamp_source
+        return result
 
 
 @dataclass
 class IntermediateResults:
     """Intermediate results from each pipeline stage."""
 
-    # Stage 1: Raw VibeVoice output (before alignment)
+    # Stage 1: Raw Scribe output converted to Chalna segments.
     raw_segments: Optional[List[Segment]] = None
-    # Stage 2: After Qwen forced alignment
+    # Deprecated: Qwen alignment is no longer part of the runtime pipeline.
     aligned_segments: Optional[List[Segment]] = None
-    # Stage 3: After LLM refinement (before final re-alignment)
+    # Stage 2: After LLM refinement.
     refined_segments: Optional[List[Segment]] = None
     # Chunked ASR: per-chunk raw segments (before merging)
     chunk_raw_segments: Optional[List[List[Segment]]] = None

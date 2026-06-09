@@ -121,7 +121,7 @@ label.field .label-text {
   margin-bottom: 4px;
 }
 
-textarea, input[type="text"] {
+textarea, input[type="text"], input[type="number"] {
   width: 100%;
   background: var(--bg);
   border: 1px solid var(--border);
@@ -133,7 +133,7 @@ textarea, input[type="text"] {
   resize: vertical;
 }
 
-textarea:focus, input[type="text"]:focus {
+textarea:focus, input[type="text"]:focus, input[type="number"]:focus {
   outline: none;
   border-color: var(--accent-bright);
 }
@@ -585,9 +585,15 @@ details summary:hover { background: var(--accent-bright); }
     </label>
 
     <div class="checkbox-group">
-      <label><input type="checkbox" id="opt-alignment" checked> 타임스탬프 정렬</label>
+      <label><input type="checkbox" id="opt-diarize" checked> 화자 분리 사용</label>
+      <label><input type="checkbox" id="opt-tag-events" checked> 오디오 이벤트 태깅</label>
       <label><input type="checkbox" id="opt-refinement" checked> LLM 자막 교정</label>
     </div>
+
+    <label class="field">
+      <span class="label-text">예상 화자 수 (선택)</span>
+      <input type="number" id="num-speakers-input" min="1" max="32" placeholder="자동">
+    </label>
 
     <button class="submit" id="btn-submit" disabled>변환</button>
   </div>
@@ -695,9 +701,7 @@ details summary:hover { background: var(--accent-bright); }
   // Order must match actual pipeline execution order
   const PIPELINE_STAGES = [
     { key: 'validating', name: '오디오 검증' },
-    { key: 'transcribing', name: '자막 생성 (VibeVoice ASR)' },
-    { key: 'loading_models', name: '정렬 모델 로딩' },
-    { key: 'aligning', name: '타임스탬프 정렬 (Qwen)' },
+    { key: 'transcribing', name: '자막 생성 (Scribe V2)' },
     { key: 'refining', name: '자막 교정 (LLM)' },
   ];
 
@@ -705,8 +709,10 @@ details summary:hover { background: var(--accent-bright); }
   const dropZone = document.getElementById('drop-zone');
   const fileInput = document.getElementById('file-input');
   const contextInput = document.getElementById('context-input');
-  const optAlignment = document.getElementById('opt-alignment');
+  const optDiarize = document.getElementById('opt-diarize');
+  const optTagEvents = document.getElementById('opt-tag-events');
   const optRefinement = document.getElementById('opt-refinement');
+  const numSpeakersInput = document.getElementById('num-speakers-input');
   const btnSubmit = document.getElementById('btn-submit');
 
   const viewIdle = document.getElementById('view-idle');
@@ -788,7 +794,11 @@ details summary:hover { background: var(--accent-bright); }
       fd.append('context', contextInput.value.trim());
     }
     fd.append('include_speaker', 'true');
-    fd.append('use_alignment', optAlignment.checked ? 'true' : 'false');
+    fd.append('diarize', optDiarize.checked ? 'true' : 'false');
+    fd.append('tag_audio_events', optTagEvents.checked ? 'true' : 'false');
+    if (numSpeakersInput.value.trim()) {
+      fd.append('num_speakers', numSpeakersInput.value.trim());
+    }
     fd.append('use_llm_refinement', optRefinement.checked ? 'true' : 'false');
     fd.append('output_format', 'srt');
     fd.append('include_intermediate', 'true');
@@ -1001,9 +1011,7 @@ details summary:hover { background: var(--accent-bright); }
       let intermediateBtn = '';
       if (isDone) {
         if (stage.key === 'transcribing' && job.raw_srt) {
-          intermediateBtn = '<button class="step-intermediate-btn" onclick="showSrtModal(\'Raw ASR 결과\', window._currentJobData.raw_srt)">결과 보기</button>';
-        } else if (stage.key === 'aligning' && job.aligned_srt) {
-          intermediateBtn = '<button class="step-intermediate-btn" onclick="showSrtModal(\'정렬 결과\', window._currentJobData.aligned_srt)">결과 보기</button>';
+          intermediateBtn = '<button class="step-intermediate-btn" onclick="showSrtModal(\'Scribe V2 결과\', window._currentJobData.raw_srt)">결과 보기</button>';
         } else if (stage.key === 'refining' && job.refined_srt) {
           intermediateBtn = '<button class="step-intermediate-btn" onclick="showSrtModal(\'교정 결과\', window._currentJobData.refined_srt)">결과 보기</button>';
         }
@@ -1130,16 +1138,13 @@ details summary:hover { background: var(--accent-bright); }
     btnDownload.onclick = () => downloadSrt(job.result || '', 'output.srt');
 
     // Intermediate results
-    const hasIntermediate = job.raw_srt || job.aligned_srt || job.refined_srt;
+    const hasIntermediate = job.raw_srt || job.refined_srt;
     if (hasIntermediate) {
       intermediateSection.style.display = '';
       intermediateButtons.innerHTML = '';
 
       if (job.raw_srt) {
-        intermediateButtons.appendChild(makeDownloadBtn('Raw (VibeVoice)', job.raw_srt, 'raw.srt'));
-      }
-      if (job.aligned_srt) {
-        intermediateButtons.appendChild(makeDownloadBtn('Aligned (Qwen)', job.aligned_srt, 'aligned.srt'));
+        intermediateButtons.appendChild(makeDownloadBtn('Raw (Scribe V2)', job.raw_srt, 'raw.srt'));
       }
       if (job.refined_srt) {
         intermediateButtons.appendChild(makeDownloadBtn('Refined (LLM)', job.refined_srt, 'refined.srt'));

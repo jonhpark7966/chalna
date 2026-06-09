@@ -9,27 +9,32 @@ import json
 import os
 import tempfile
 import uuid
-from datetime import datetime, timedelta as _timedelta
+from datetime import datetime
+from datetime import timedelta as _timedelta
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-
-# Results storage directory
-RESULTS_DIR = Path(os.environ.get("CHALNA_RESULTS_DIR", "/home/jonhpark/workspace/chalna/results"))
-RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
 from chalna import __version__
-from chalna.db import init_db, save_job as db_save_job, list_jobs as db_list_jobs, get_job as db_get_job, count_jobs as db_count_jobs, migrate_from_results_dir
+from chalna.db import count_jobs as db_count_jobs
+from chalna.db import get_job as db_get_job
+from chalna.db import init_db, migrate_from_results_dir
+from chalna.db import list_jobs as db_list_jobs
+from chalna.db import save_job as db_save_job
 from chalna.exceptions import ChalnaError
+from chalna.models import ScribeOptions
 from chalna.monitoring import capture_job_exception, init_sentry
 from chalna.settings import settings
 from chalna.validation import validate_audio_file
 
+# Results storage directory
+RESULTS_DIR = Path(os.environ.get("CHALNA_RESULTS_DIR", "/home/jonhpark/workspace/chalna/results"))
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # =============================================================================
 # App Setup
@@ -101,12 +106,27 @@ _job_params: Dict[str, Dict[str, Any]] = {}  # queued job parameters
 # Performance stats for ETA estimation (seconds of processing per second of audio)
 # Updated with exponential moving average as jobs complete
 _performance_stats: Dict[str, float] = {
-    "asr_rate": 0.133,       # ~8s per min of audio
-    "align_rate": 0.017,     # ~1s per min of audio
+    "asr_rate": 0.133,       # Scribe API latency per second of audio, adjusted by jobs
     "refine_rate": 0.067,    # ~4s per min of audio (with parallel refinement)
-    "overhead": 10.0,        # flat overhead (model load, validation, formatting)
+    "overhead": 10.0,        # flat overhead (validation, upload, formatting)
     "completed_count": 0,
 }
+
+
+def _make_scribe_options(
+    *,
+    diarize: bool,
+    tag_audio_events: bool,
+    num_speakers: Optional[int],
+) -> ScribeOptions:
+    try:
+        return ScribeOptions(
+            diarize=diarize,
+            tag_audio_events=tag_audio_events,
+            num_speakers=num_speakers,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 def get_pipeline():
@@ -153,8 +173,6 @@ def _estimate_job_duration(job: "Job") -> float:
 
     duration = job.audio_duration
     rate = _performance_stats["asr_rate"]
-    if job.use_alignment:
-        rate += _performance_stats["align_rate"]
     if job.use_llm_refinement:
         rate += _performance_stats["refine_rate"]
 
@@ -250,9 +268,8 @@ def _update_performance_stats(job: "Job") -> None:
     total_elapsed = (job.completed_at - job.started_at).total_seconds()
 
     asr_time = _ts_range(stage_times.get("transcribing", []))
-    align_time = _ts_range(stage_times.get("aligning", []))
     refine_time = _ts_range(stage_times.get("refining", []))
-    overhead = max(0.0, total_elapsed - asr_time - align_time - refine_time)
+    overhead = max(0.0, total_elapsed - asr_time - refine_time)
 
     # Exponential moving average (alpha=0.3 gives recent data more weight)
     alpha = 0.3
@@ -265,10 +282,6 @@ def _update_performance_stats(job: "Job") -> None:
     _performance_stats["asr_rate"] = (
         alpha * (asr_time / dur) + (1 - alpha) * _performance_stats["asr_rate"]
     )
-    if job.use_alignment and align_time > 0:
-        _performance_stats["align_rate"] = (
-            alpha * (align_time / dur) + (1 - alpha) * _performance_stats["align_rate"]
-        )
     if job.use_llm_refinement and refine_time > 0:
         _performance_stats["refine_rate"] = (
             alpha * (refine_time / dur) + (1 - alpha) * _performance_stats["refine_rate"]
@@ -305,9 +318,9 @@ class Job(BaseModel):
     refinement_log: Optional[List[dict]] = None
     progress_history: List[Dict[str, Any]] = Field(default_factory=list)
     # Intermediate results
-    raw_srt: Optional[str] = None  # Stage 1: VibeVoice raw
-    aligned_srt: Optional[str] = None  # Stage 2: After forced alignment
-    refined_srt: Optional[str] = None  # Stage 3: After LLM refinement
+    raw_srt: Optional[str] = None  # Stage 1: Scribe raw
+    aligned_srt: Optional[str] = None  # Deprecated: Qwen alignment is disabled
+    refined_srt: Optional[str] = None  # Stage 2: After LLM refinement
     # Chunk observability
     chunks_completed: int = 0
     total_chunks: int = 0
@@ -316,7 +329,7 @@ class Job(BaseModel):
     refined: Optional[bool] = None
     # ETA estimation
     audio_duration: Optional[float] = None  # seconds
-    use_alignment: bool = True
+    use_alignment: bool = False
     use_llm_refinement: bool = True
 
 
@@ -331,7 +344,7 @@ class ErrorResponse(BaseModel):
 
 class TranscriptionProgress(BaseModel):
     """Progress update during transcription."""
-    stage: str  # "validating", "loading_models", "transcribing", "aligning"
+    stage: str  # "validating", "transcribing", "refining"
     progress: float  # 0.0 ~ 1.0
 
 
@@ -396,9 +409,10 @@ class MetadataModel(BaseModel):
     duration: float
     language: Optional[str] = None
     speakers: list[str] = Field(default_factory=list)
-    model_version: str = "vibevoice-asr"
-    aligned: bool = True
+    model_version: str = "scribe_v2"
+    aligned: bool = False
     refined: bool = True
+    timestamp_source: Optional[str] = None
 
 
 class TranscriptionResultModel(BaseModel):
@@ -444,40 +458,24 @@ async def health():
     """
     Check server health and model status.
     """
-    gpu = None
-    try:
-        import torch
-        if torch.cuda.is_available():
-            gpu = torch.cuda.get_device_name(0)
-    except ImportError:
-        pass
-
-    # Check model status
     models = {
-        "vibevoice": "not_loaded",
-        "qwen_aligner": "not_loaded",
+        "scribe_v2": "configured" if settings.elevenlabs_api_key else "missing_api_key",
     }
-
-    if _pipeline is not None:
-        if _pipeline._vibevoice_model is not None:
-            models["vibevoice"] = "loaded"
-        if _pipeline._aligner is not None:
-            models["qwen_aligner"] = "loaded"
 
     return HealthResponse(
         status="ok",
         version=__version__,
         models=models,
-        gpu=gpu,
+        gpu=None,
     )
 
 
 def _run_doctor_checks() -> List[DoctorCheck]:
-    """Inspect external tools, GPU/torch, and model config.
+    """Inspect external tools and Scribe runtime configuration.
 
     Critical checks failing -> status "error"; only non-critical failing ->
-    "degraded". `codex` is non-critical (transcription works without it) but its
-    absence silently disables LLM refinement / translation, so it is reported loudly.
+    "degraded". `codex` is non-critical because transcription works without LLM
+    refinement or translation.
     """
     import shutil
     import subprocess as _sp
@@ -497,36 +495,36 @@ def _run_doctor_checks() -> List[DoctorCheck]:
         checks.append(DoctorCheck(name="codex", ok=True, critical=False,
                                   detail=f"{codex_path} ({ver})" if ver else codex_path))
     else:
-        checks.append(DoctorCheck(name="codex", ok=False, critical=False,
-                                  detail="codex CLI not found on PATH — LLM refinement/translation disabled"))
+        checks.append(DoctorCheck(
+            name="codex",
+            ok=False,
+            critical=False,
+            detail="codex CLI not found on PATH - LLM refinement/translation disabled",
+        ))
 
     # ffmpeg — audio/video decoding
     ff = shutil.which("ffmpeg")
     checks.append(DoctorCheck(name="ffmpeg", ok=bool(ff), critical=True,
                               detail=ff or "ffmpeg not found on PATH"))
 
-    # torch + CUDA
-    try:
-        import torch
-        cuda = torch.cuda.is_available()
-        dev = torch.cuda.get_device_name(0) if cuda else None
-        checks.append(DoctorCheck(name="torch", ok=True, critical=True, detail=f"torch {torch.__version__}"))
-        checks.append(DoctorCheck(name="gpu", ok=cuda, critical=True, detail=dev or "CUDA not available"))
-    except Exception as e:
-        checks.append(DoctorCheck(name="torch", ok=False, critical=True, detail=f"{type(e).__name__}: {e}"))
-        checks.append(DoctorCheck(name="gpu", ok=False, critical=True, detail="torch import failed"))
-
-    # transformers
-    try:
-        import transformers
-        checks.append(DoctorCheck(name="transformers", ok=True, critical=True,
-                                  detail=f"transformers {transformers.__version__}"))
-    except Exception as e:
-        checks.append(DoctorCheck(name="transformers", ok=False, critical=True, detail=f"{type(e).__name__}: {e}"))
-
-    # model configuration (loadability is verified lazily at transcribe time)
-    checks.append(DoctorCheck(name="vibevoice_model", ok=True, critical=False,
-                              detail=settings.vibevoice_model_path))
+    checks.append(DoctorCheck(
+        name="elevenlabs_api_key",
+        ok=bool(settings.elevenlabs_api_key),
+        critical=True,
+        detail="configured" if settings.elevenlabs_api_key else "ELEVENLABS_API_KEY is not set",
+    ))
+    checks.append(DoctorCheck(
+        name="scribe_model",
+        ok=bool(settings.scribe_model_id),
+        critical=True,
+        detail=settings.scribe_model_id,
+    ))
+    checks.append(DoctorCheck(
+        name="scribe_cache",
+        ok=True,
+        critical=False,
+        detail=settings.scribe_cache_dir,
+    ))
 
     return checks
 
@@ -534,8 +532,8 @@ def _run_doctor_checks() -> List[DoctorCheck]:
 @app.get("/doctor", response_model=DoctorResponse)
 async def doctor():
     """
-    Diagnose the runtime setup: external tools (codex, ffmpeg), GPU/torch,
-    and model configuration. Surfaces environment issues that /health does not
+    Diagnose the runtime setup: external tools (codex, ffmpeg), Scribe config,
+    and cache configuration. Surfaces environment issues that /health does not
     (e.g. a missing codex CLI that silently disables LLM refinement/translation).
     """
     checks = _run_doctor_checks()
@@ -600,10 +598,13 @@ async def transcribe(
     context: Optional[str] = Form(None, description="Context/hotwords for better accuracy"),
     language: Optional[str] = Form(None, description="Language hint (ko, en, ja, zh)"),
     include_speaker: bool = Form(True, description="Include speaker labels"),
-    use_alignment: bool = Form(True, description="Use Qwen forced alignment"),
-    use_llm_refinement: bool = Form(True, description="Use LLM to refine subtitles"),
+    use_alignment: bool = Form(True, description="Deprecated; ignored"),
+    use_llm_refinement: bool = Form(True, description="Refine Scribe output with LLM"),
+    diarize: bool = Form(True, description="Enable Scribe speaker diarization"),
+    tag_audio_events: bool = Form(True, description="Tag non-speech audio events"),
+    num_speakers: Optional[int] = Form(None, description="Expected speaker count (1-32)"),
     output_format: Literal["srt", "json"] = Form("srt", description="Output format"),
-    include_logs: bool = Form(False, description="Include alignment/refinement logs in JSON output"),
+    include_logs: bool = Form(False, description="Include refinement logs in JSON output"),
     include_intermediate: bool = Form(False, description="Include intermediate stage results"),
 ):
     """
@@ -624,6 +625,11 @@ async def transcribe(
     # Validate file
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file provided")
+    _make_scribe_options(
+        diarize=diarize,
+        tag_audio_events=tag_audio_events,
+        num_speakers=num_speakers,
+    )
 
     # Save uploaded file
     suffix = Path(file.filename).suffix
@@ -647,7 +653,7 @@ async def transcribe(
         created_at=datetime.utcnow(),
         output_format=output_format,
         audio_duration=audio_info.duration_seconds,
-        use_alignment=use_alignment,
+        use_alignment=False,
         use_llm_refinement=use_llm_refinement,
     )
     _jobs[job_id] = job
@@ -659,6 +665,9 @@ async def transcribe(
         include_speaker=include_speaker,
         use_alignment=use_alignment,
         use_llm_refinement=use_llm_refinement,
+        diarize=diarize,
+        tag_audio_events=tag_audio_events,
+        num_speakers=num_speakers,
         output_format=output_format,
         include_logs=include_logs,
         include_intermediate=include_intermediate,
@@ -701,10 +710,13 @@ async def transcribe_async(
     context: Optional[str] = Form(None, description="Context/hotwords for better accuracy"),
     language: Optional[str] = Form(None, description="Language hint (ko, en, ja, zh)"),
     include_speaker: bool = Form(True, description="Include speaker labels"),
-    use_alignment: bool = Form(True, description="Use Qwen forced alignment"),
-    use_llm_refinement: bool = Form(True, description="Use LLM to refine subtitles"),
+    use_alignment: bool = Form(True, description="Deprecated; ignored"),
+    use_llm_refinement: bool = Form(True, description="Refine Scribe output with LLM"),
+    diarize: bool = Form(True, description="Enable Scribe speaker diarization"),
+    tag_audio_events: bool = Form(True, description="Tag non-speech audio events"),
+    num_speakers: Optional[int] = Form(None, description="Expected speaker count (1-32)"),
     output_format: Literal["srt", "json"] = Form("srt", description="Output format"),
-    include_logs: bool = Form(False, description="Include alignment/refinement logs in result"),
+    include_logs: bool = Form(False, description="Include refinement logs in result"),
     include_intermediate: bool = Form(False, description="Include intermediate stage results"),
 ):
     """
@@ -715,6 +727,11 @@ async def transcribe_async(
     # Validate file
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file provided")
+    _make_scribe_options(
+        diarize=diarize,
+        tag_audio_events=tag_audio_events,
+        num_speakers=num_speakers,
+    )
 
     # Save uploaded file
     suffix = Path(file.filename).suffix
@@ -739,7 +756,7 @@ async def transcribe_async(
         created_at=datetime.utcnow(),
         output_format=output_format,
         audio_duration=audio_info.duration_seconds,
-        use_alignment=use_alignment,
+        use_alignment=False,
         use_llm_refinement=use_llm_refinement,
     )
     _jobs[job_id] = job
@@ -752,6 +769,9 @@ async def transcribe_async(
         include_speaker=include_speaker,
         use_alignment=use_alignment,
         use_llm_refinement=use_llm_refinement,
+        diarize=diarize,
+        tag_audio_events=tag_audio_events,
+        num_speakers=num_speakers,
         output_format=output_format,
         include_logs=include_logs,
         include_intermediate=include_intermediate,
@@ -818,7 +838,9 @@ async def get_active_jobs():
                 "queue_position": _compute_queue_position(job.job_id),
                 "estimated_wait_seconds": eta.get("wait_seconds"),
                 "estimated_processing_seconds": eta.get("processing_seconds"),
-                "estimated_completion": eta.get("completion").isoformat() if eta.get("completion") else None,
+                "estimated_completion": (
+                    eta.get("completion").isoformat() if eta.get("completion") else None
+                ),
             })
     return {"jobs": active}
 
@@ -896,12 +918,7 @@ async def get_job(job_id: str):
 
 @app.get("/jobs/{job_id}/chunks/{chunk_index}")
 async def get_chunk_result(job_id: str, chunk_index: int):
-    """
-    Get raw ASR SRT result for a specific chunk.
-
-    Returns the per-chunk VibeVoice output before merging/alignment.
-    Available once the chunk has been processed (check chunks_completed in job status).
-    """
+    """Get raw ASR SRT result for a specific chunk, if chunked output exists."""
     if job_id not in _jobs:
         raise HTTPException(status_code=404, detail="Job not found")
 
@@ -915,7 +932,10 @@ async def get_chunk_result(job_id: str, chunk_index: int):
             )
         raise HTTPException(
             status_code=404,
-            detail=f"Chunk {chunk_index} not yet available (completed: {job.chunks_completed}/{job.total_chunks})",
+            detail=(
+                f"Chunk {chunk_index} not yet available "
+                f"(completed: {job.chunks_completed}/{job.total_chunks})"
+            ),
         )
 
     return PlainTextResponse(
@@ -961,6 +981,9 @@ async def _process_job(
     include_speaker: bool,
     use_alignment: bool,
     use_llm_refinement: bool,
+    diarize: bool,
+    tag_audio_events: bool,
+    num_speakers: Optional[int],
     output_format: str,
     include_logs: bool = False,
     include_intermediate: bool = False,
@@ -985,12 +1008,10 @@ async def _process_job(
 
         # Map stage progress to overall job progress
         # Weights match actual pipeline order:
-        # validating → transcribing → loading_models → aligning → refining
+        # validating → transcribing → optional refining
         stage_weights = {
             "validating": (0.0, 0.05),
-            "transcribing": (0.05, 0.55),
-            "loading_models": (0.55, 0.60),
-            "aligning": (0.60, 0.80),
+            "transcribing": (0.05, 0.80 if use_llm_refinement else 0.95),
             "refining": (0.80, 0.95),
         }
         if stage in stage_weights:
@@ -1004,8 +1025,6 @@ async def _process_job(
                 p = get_pipeline()
                 if stage == "transcribing" and p._raw_segments:
                     job.raw_srt = segments_to_srt(p._raw_segments, include_speaker=True)
-                elif stage == "aligning" and p._aligned_segments:
-                    job.aligned_srt = segments_to_srt(p._aligned_segments, include_speaker=True)
                 elif stage == "refining" and p._refined_segments:
                     job.refined_srt = segments_to_srt(p._refined_segments, include_speaker=True)
             except Exception:
@@ -1018,8 +1037,13 @@ async def _process_job(
 
         # Get pipeline
         pipeline = get_pipeline()
-        pipeline.use_alignment = use_alignment
+        pipeline.use_alignment = False
         pipeline.use_llm_refinement = use_llm_refinement
+        scribe_options = _make_scribe_options(
+            diarize=diarize,
+            tag_audio_events=tag_audio_events,
+            num_speakers=num_speakers,
+        )
 
         # Run transcription (in thread pool to not block)
         loop = asyncio.get_event_loop()
@@ -1030,6 +1054,7 @@ async def _process_job(
                 context=context,
                 language=language,
                 progress_callback=progress_callback,
+                scribe_options=scribe_options,
             )
         )
 
@@ -1047,11 +1072,6 @@ async def _process_job(
             if result.intermediate.raw_segments:
                 job.raw_srt = segments_to_srt(
                     result.intermediate.raw_segments, include_speaker=True
-                )
-
-            if result.intermediate.aligned_segments:
-                job.aligned_srt = segments_to_srt(
-                    result.intermediate.aligned_segments, include_speaker=True
                 )
 
             if result.intermediate.refined_segments:
@@ -1074,7 +1094,6 @@ async def _process_job(
                 result_data["refinement_log"] = job.refinement_log
             if include_intermediate:
                 result_data["raw_srt"] = job.raw_srt
-                result_data["aligned_srt"] = job.aligned_srt
                 result_data["refined_srt"] = job.refined_srt
             import json
             job.result = json.dumps(result_data, ensure_ascii=False, indent=2)
@@ -1147,7 +1166,10 @@ def _load_srt_from_results(results_dir_name: str) -> Optional[str]:
         return None
     # Find .srt files that aren't intermediate (_raw, _aligned, _refined)
     for srt_file in sorted(job_dir.glob("*.srt")):
-        if "_raw" not in srt_file.name and "_aligned" not in srt_file.name and "_refined" not in srt_file.name:
+        is_intermediate = any(
+            marker in srt_file.name for marker in ("_raw", "_aligned", "_refined")
+        )
+        if not is_intermediate:
             try:
                 return srt_file.read_text(encoding="utf-8")
             except OSError:
@@ -1180,8 +1202,7 @@ def _save_job_results(job: Job, result, include_speaker: bool) -> None:
     Creates:
     - {job_id}.srt - Final SRT output
     - {job_id}.json - Full result with metadata
-    - {job_id}_raw.srt - Raw VibeVoice output (if available)
-    - {job_id}_aligned.srt - After alignment (if available)
+    - {job_id}_raw.srt - Raw Scribe output (if available)
     - {job_id}_refined.srt - After LLM refinement (if available)
     """
     try:
@@ -1224,16 +1245,21 @@ def _save_job_results(job: Job, result, include_speaker: bool) -> None:
 
         if result.intermediate:
             if result.intermediate.raw_segments:
-                raw_srt = job.raw_srt or segments_to_srt(result.intermediate.raw_segments, include_speaker=True)
+                raw_srt = job.raw_srt or segments_to_srt(
+                    result.intermediate.raw_segments,
+                    include_speaker=True,
+                )
                 (job_dir / f"{base_name}_1_raw.srt").write_text(raw_srt, encoding="utf-8")
 
-            if result.intermediate.aligned_segments:
-                aligned_srt = job.aligned_srt or segments_to_srt(result.intermediate.aligned_segments, include_speaker=True)
-                (job_dir / f"{base_name}_2_aligned.srt").write_text(aligned_srt, encoding="utf-8")
-
             if result.intermediate.refined_segments:
-                refined_srt = job.refined_srt or segments_to_srt(result.intermediate.refined_segments, include_speaker=True)
-                (job_dir / f"{base_name}_3_refined.srt").write_text(refined_srt, encoding="utf-8")
+                refined_srt = job.refined_srt or segments_to_srt(
+                    result.intermediate.refined_segments,
+                    include_speaker=True,
+                )
+                (job_dir / f"{base_name}_2_refined.srt").write_text(
+                    refined_srt,
+                    encoding="utf-8",
+                )
 
         print(f"Results saved to: {job_dir}")
 
@@ -1285,7 +1311,7 @@ async def startup():
     print(f"Job DB initialized: {total} jobs in history")
 
     _queue_worker_task = asyncio.create_task(_queue_worker())
-    print(f"Job queue worker started")
+    print("Job queue worker started")
     print(f"Results will be saved to: {RESULTS_DIR}")
 
 

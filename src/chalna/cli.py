@@ -18,6 +18,7 @@ from chalna.exceptions import (
     CodexRateLimitError,
     CorruptedFileError,
     DiskSpaceError,
+    ElevenLabsAPIError,
     EmptyTranscriptionError,
     FFmpegNotFoundError,
     FilePermissionError,
@@ -27,8 +28,8 @@ from chalna.exceptions import (
     OutOfMemoryError,
     TempFileError,
     UnsupportedFormatError,
-    VibevoiceAPIError,
 )
+from chalna.models import ScribeOptions
 
 app = typer.Typer(
     name="chalna",
@@ -69,12 +70,27 @@ def transcribe(
     no_align: bool = typer.Option(
         False,
         "--no-align",
-        help="Skip Qwen forced alignment (faster, less accurate timestamps)",
+        help="Deprecated; ignored because Qwen forced alignment is disabled",
     ),
     llm_refine: bool = typer.Option(
         True,
         "--llm-refine/--no-llm-refine",
-        help="Use LLM to refine subtitles (requires Codex CLI)",
+        help="Use LLM to refine Scribe subtitles (requires Codex CLI)",
+    ),
+    diarize: bool = typer.Option(
+        True,
+        "--diarize/--no-diarize",
+        help="Enable Scribe speaker diarization",
+    ),
+    tag_audio_events: bool = typer.Option(
+        True,
+        "--tag-audio-events/--no-tag-audio-events",
+        help="Include Scribe non-speech audio event tags",
+    ),
+    num_speakers: Optional[int] = typer.Option(
+        None,
+        "--num-speakers",
+        help="Expected speaker count for Scribe diarization (1-32)",
     ),
     json_output: bool = typer.Option(
         False,
@@ -84,7 +100,7 @@ def transcribe(
     save_intermediate: bool = typer.Option(
         False,
         "--save-intermediate",
-        help="Save intermediate results (pre-alignment, alignment log)",
+        help="Save raw Scribe/refinement intermediate results",
     ),
     device: str = typer.Option(
         "auto",
@@ -113,7 +129,7 @@ def transcribe(
         suffix = ".json" if json_output else ".srt"
         output = input_file.with_suffix(suffix)
 
-    console.print(f"[bold blue]Chalna (찰나)[/bold blue] - SRT Subtitle Generator")
+    console.print("[bold blue]Chalna (찰나)[/bold blue] - SRT Subtitle Generator")
     console.print()
     console.print(f"  Input:  {input_file}")
     console.print(f"  Output: {output}")
@@ -127,14 +143,13 @@ def transcribe(
             TextColumn("[progress.description]{task.description}"),
             console=console,
         ) as progress:
-            # Load models
-            task = progress.add_task("Loading models...", total=None)
+            task = progress.add_task("Transcribing with Scribe v2...", total=None)
 
             from chalna.pipeline import ChalnaPipeline
 
             pipeline = ChalnaPipeline(
                 device=device,
-                use_alignment=not no_align,
+                use_alignment=False,
                 use_llm_refinement=llm_refine,
             )
 
@@ -146,12 +161,18 @@ def transcribe(
                 context=context,
                 language=language,
                 verbose=verbose,
+                scribe_options=ScribeOptions(
+                    diarize=diarize,
+                    tag_audio_events=tag_audio_events,
+                    num_speakers=num_speakers,
+                ),
             )
 
             progress.update(task, description="Writing output...")
 
             # Save intermediate results (always save stage SRTs)
             import json as json_module
+
             from chalna.srt_utils import segments_to_srt
 
             base_path = output.parent / output.stem
@@ -159,7 +180,7 @@ def transcribe(
             # Get intermediate results from result (thread-safe)
             intermediate = result.intermediate
 
-            # Stage 1: Raw segments (VibeVoice)
+            # Stage 1: Raw segments (Scribe)
             raw_segments = intermediate.raw_segments if intermediate else None
             if raw_segments:
                 raw_srt_path = base_path.parent / f"{base_path.name}_1_raw.srt"
@@ -167,27 +188,19 @@ def transcribe(
                 raw_srt_path.write_text(raw_srt_content, encoding="utf-8")
                 console.print(f"  Raw SRT: {raw_srt_path}")
 
-            # Stage 2: Aligned segments (Qwen)
-            aligned_segments = intermediate.aligned_segments if intermediate else None
-            if aligned_segments:
-                aligned_srt_path = base_path.parent / f"{base_path.name}_2_aligned.srt"
-                aligned_srt_content = segments_to_srt(aligned_segments, include_speaker=True)
-                aligned_srt_path.write_text(aligned_srt_content, encoding="utf-8")
-                console.print(f"  Aligned SRT: {aligned_srt_path}")
-
-            # Stage 3: Refined segments (LLM)
+            # Stage 2: Refined segments (LLM)
             refined_segments = intermediate.refined_segments if intermediate else None
             if refined_segments:
-                refined_srt_path = base_path.parent / f"{base_path.name}_3_refined.srt"
+                refined_srt_path = base_path.parent / f"{base_path.name}_2_refined.srt"
                 refined_srt_content = segments_to_srt(refined_segments, include_speaker=True)
                 refined_srt_path.write_text(refined_srt_content, encoding="utf-8")
                 console.print(f"  Refined SRT: {refined_srt_path}")
 
             # Save detailed logs only if --save-intermediate is set
             if save_intermediate:
-                from chalna.models import TranscriptionResult, TranscriptionMetadata
+                from chalna.models import TranscriptionMetadata, TranscriptionResult
 
-                # Save pre-alignment JSON
+                # Save raw Scribe JSON
                 if raw_segments:
                     pre_json_path = base_path.parent / f"{base_path.name}_1_raw.json"
                     pre_result = TranscriptionResult(
@@ -196,8 +209,9 @@ def transcribe(
                             duration=max((s.end_time for s in raw_segments), default=0.0),
                             language=language,
                             speakers=list(set(s.speaker_id for s in raw_segments if s.speaker_id)),
-                            model_version="vibevoice-asr",
+                            model_version="scribe_v2",
                             aligned=False,
+                            timestamp_source="scribe_v2",
                         )
                     )
                     pre_json_path.write_text(pre_result.to_json(), encoding="utf-8")
@@ -270,7 +284,7 @@ def transcribe(
 
         # Summary
         console.print()
-        console.print(f"[bold green]Done![/bold green]")
+        console.print("[bold green]Done![/bold green]")
         console.print(f"  Segments: {len(result.segments)}")
         console.print(f"  Duration: {result.metadata.duration:.1f}s")
         if result.metadata.speakers:
@@ -280,7 +294,7 @@ def transcribe(
         console.print(f"  Output saved to: {output}")
 
     except AudioTooLongError as e:
-        console.print(f"[bold red]Error:[/bold red] Audio too long")
+        console.print("[bold red]Error:[/bold red] Audio too long")
         console.print(f"  Duration: {e.details['duration_seconds']:.1f}s")
         console.print(f"  Maximum: {e.details['max_duration_seconds']:.0f}s (10 hours)")
         console.print()
@@ -289,9 +303,12 @@ def transcribe(
         raise typer.Exit(code=1)
 
     except FileTooLargeError as e:
-        console.print(f"[bold red]Error:[/bold red] File too large")
+        console.print("[bold red]Error:[/bold red] File too large")
         console.print(f"  File size: {e.details['file_size_mb']:.1f} MB")
-        console.print(f"  Maximum: {e.details['max_size_mb']:.0f} MB ({e.details['max_size_mb'] / 1024:.1f} GB)")
+        console.print(
+            f"  Maximum: {e.details['max_size_mb']:.0f} MB "
+            f"({e.details['max_size_mb'] / 1024:.1f} GB)"
+        )
         console.print()
         console.print("[dim]Tip: Compress or split the file:[/dim]")
         console.print("[dim]  ffmpeg -i input.mp4 -b:a 128k compressed.mp4[/dim]")
@@ -301,12 +318,12 @@ def transcribe(
         console.print(f"[bold red]Error:[/bold red] Unsupported format: {e.details['format']}")
         console.print()
         console.print("[dim]Supported formats:[/dim]")
-        console.print(f"[dim]  Audio: mp3, wav, flac, aac, ogg, opus, m4a, wma[/dim]")
-        console.print(f"[dim]  Video: mp4, mov, webm, mkv, avi[/dim]")
+        console.print("[dim]  Audio: mp3, wav, flac, aac, ogg, opus, m4a, wma[/dim]")
+        console.print("[dim]  Video: mp4, mov, webm, mkv, avi[/dim]")
         raise typer.Exit(code=1)
 
     except CorruptedFileError as e:
-        console.print(f"[bold red]Error:[/bold red] Corrupted or unreadable file")
+        console.print("[bold red]Error:[/bold red] Corrupted or unreadable file")
         if e.details.get("reason"):
             console.print(f"  Reason: {e.details['reason']}")
         console.print()
@@ -315,7 +332,7 @@ def transcribe(
         raise typer.Exit(code=1)
 
     except FilePermissionError as e:
-        console.print(f"[bold red]Error:[/bold red] Permission denied")
+        console.print("[bold red]Error:[/bold red] Permission denied")
         console.print(f"  Cannot read: {e.details['file_path']}")
         console.print()
         console.print("[dim]Tip: Check file permissions[/dim]")
@@ -345,7 +362,10 @@ def transcribe(
         raise typer.Exit(code=0)  # Exit 0 since this isn't an error per se
 
     except ModelLoadError as e:
-        console.print(f"[bold red]Error:[/bold red] Failed to load model: {e.details['model_name']}")
+        console.print(
+            f"[bold red]Error:[/bold red] Failed to load model: "
+            f"{e.details['model_name']}"
+        )
         if e.details.get("reason"):
             console.print(f"  Reason: {e.details['reason']}")
         console.print()
@@ -355,7 +375,10 @@ def transcribe(
         raise typer.Exit(code=1)
 
     except ModelDownloadError as e:
-        console.print(f"[bold red]Error:[/bold red] Failed to download model: {e.details['model_name']}")
+        console.print(
+            f"[bold red]Error:[/bold red] Failed to download model: "
+            f"{e.details['model_name']}"
+        )
         console.print()
         console.print("[dim]Suggestions:[/dim]")
         console.print("  - Check your internet connection")
@@ -363,17 +386,17 @@ def transcribe(
         console.print("  - Set HF_HUB_OFFLINE=1 to use cached models")
         raise typer.Exit(code=1)
 
-    except VibevoiceAPIError as e:
-        console.print(f"[bold red]Error:[/bold red] VibeVoice error")
+    except ElevenLabsAPIError as e:
+        console.print("[bold red]Error:[/bold red] ElevenLabs Scribe error")
         console.print(f"  {e.message}")
         console.print()
         console.print("[dim]Suggestions:[/dim]")
-        console.print("  - Ensure VibeVoice is installed: cd external/VibeVoice && pip install -e .")
-        console.print("  - Check GPU memory availability")
+        console.print("  - Set ELEVENLABS_API_KEY in your environment or .env")
+        console.print("  - Check your ElevenLabs quota and network connectivity")
         raise typer.Exit(code=1)
 
     except CodexAPIError as e:
-        console.print(f"[bold red]Error:[/bold red] Codex CLI failed")
+        console.print("[bold red]Error:[/bold red] Codex CLI failed")
         console.print(f"  Reason: {e.details['reason']}")
         console.print()
         console.print("[dim]Suggestions:[/dim]")
@@ -382,7 +405,7 @@ def transcribe(
         raise typer.Exit(code=1)
 
     except CodexRateLimitError as e:
-        console.print(f"[bold red]Error:[/bold red] Codex API rate limit exceeded")
+        console.print("[bold red]Error:[/bold red] Codex API rate limit exceeded")
         console.print(f"  Reason: {e.details['reason']}")
         console.print()
         console.print("[dim]Suggestions:[/dim]")
@@ -399,7 +422,10 @@ def transcribe(
         raise typer.Exit(code=1)
 
     except TempFileError as e:
-        console.print(f"[bold red]Error:[/bold red] Temporary file operation failed: {e.details['operation']}")
+        console.print(
+            f"[bold red]Error:[/bold red] Temporary file operation failed: "
+            f"{e.details['operation']}"
+        )
         console.print()
         console.print("[dim]Suggestions:[/dim]")
         console.print("  - Check temp directory permissions")
@@ -476,7 +502,7 @@ def validate_boundaries(
     language: str = typer.Option(
         "Korean",
         "--alignment-language",
-        help="Language name passed to the Qwen forced aligner",
+        help="Deprecated; ignored because Qwen forced alignment is disabled",
     ),
     device: str = typer.Option(
         "auto",
@@ -503,13 +529,12 @@ def validate_boundaries(
     """
     Validate whether SRT segment boundaries are too tight for edit use.
 
-    The command re-aligns each subtitle with neighboring subtitle context and
-    reports starts/ends that sit too close to the target segment's spoken words.
+    Qwen-based audio boundary realignment is disabled in the Scribe v2 pipeline,
+    so this command currently reports SRT contract issues only.
     """
     import json as json_module
 
     from chalna.models import Segment
-    from chalna.pipeline import ChalnaPipeline
     from chalna.srt_utils import parse_srt
     from chalna.subtitle_validator import summarize_validation_diagnostics, validate_segments
 
@@ -531,37 +556,11 @@ def validate_boundaries(
 
     contract_issues = validate_segments(segments)
 
-    pipeline = ChalnaPipeline(
-        device=device,
-        use_alignment=True,
-        use_llm_refinement=False,
-    )
-
-    try:
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            console=console,
-        ) as progress:
-            task = progress.add_task("Validating subtitle boundaries...", total=None)
-            audio_issues = pipeline.validate_audio_boundaries(
-                audio_path=audio_file,
-                segments=segments,
-                scan_padding=scan_padding,
-                min_start_padding=min_start_padding,
-                min_end_padding=min_end_padding,
-                cutoff_tolerance=cutoff_tolerance,
-                language=language,
-            )
-            issues = contract_issues + audio_issues
-            progress.update(task, description="Boundary validation complete")
-    except Exception as e:
-        console.print(f"[bold red]Error:[/bold red] {e}")
-        if verbose:
-            console.print_exception()
-        raise typer.Exit(code=1)
-    finally:
-        pipeline.unload(force=True)
+    if verbose:
+        console.print(
+            "[yellow]Audio boundary validation is disabled in the Scribe v2 pipeline.[/yellow]"
+        )
+    issues = contract_issues
 
     report = {
         "audio_file": str(audio_file),
@@ -646,7 +645,7 @@ def serve(
     """
     import uvicorn
 
-    console.print(f"[bold blue]Chalna (찰나)[/bold blue] - REST API Server")
+    console.print("[bold blue]Chalna (찰나)[/bold blue] - REST API Server")
     console.print()
     console.print(f"  Host: {host}")
     console.print(f"  Port: {port}")

@@ -30,6 +30,7 @@ class ErrorCode(str, Enum):
     CODEX_API_ERROR = "E3002"
     CODEX_RATE_LIMIT = "E3003"
     VIBEVOICE_API_ERROR = "E3004"
+    ELEVENLABS_API_ERROR = "E3005"
 
     # System (4xxx)
     DISK_SPACE_ERROR = "E4001"
@@ -327,6 +328,26 @@ class VibevoiceAPIError(ChalnaError):
         details = {
             "reason": message,
         }
+        super().__init__(message, details, cause)
+
+
+class ElevenLabsAPIError(ChalnaError):
+    """Raised when ElevenLabs Scribe API calls fail."""
+
+    error_code = ErrorCode.ELEVENLABS_API_ERROR
+    http_status = 503
+
+    def __init__(
+        self,
+        message: str,
+        cause: Optional[Exception] = None,
+        status_code: Optional[int] = None,
+    ):
+        details = {
+            "reason": message,
+        }
+        if status_code is not None:
+            details["status_code"] = status_code
         super().__init__(message, details, cause)
 
 

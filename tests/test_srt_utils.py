@@ -2,14 +2,13 @@
 Tests for SRT utilities.
 """
 
-import pytest
 
 from chalna.models import Segment
 from chalna.srt_utils import (
     format_timestamp,
+    parse_srt,
     parse_srt_timestamp,
     segments_to_srt,
-    parse_srt,
 )
 
 

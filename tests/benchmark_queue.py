@@ -50,9 +50,8 @@ class BenchmarkResult:
     # Per-stage timings (seconds)
     t_validate: float = 0.0
     t_transcribe: float = 0.0
-    t_align: float = 0.0
     t_refine: float = 0.0
-    t_overhead: float = 0.0  # model load, formatting, etc.
+    t_overhead: float = 0.0  # validation, upload, formatting, etc.
     segments_count: int = 0
     chunks_total: int = 0
     progress_history: list = field(default_factory=list)
@@ -202,11 +201,8 @@ def send_async_request(
                 timings = _parse_stage_timings(result.progress_history)
                 result.t_validate = timings.get("validating", 0)
                 result.t_transcribe = timings.get("transcribing", 0)
-                result.t_align = timings.get("aligning", 0)
                 result.t_refine = timings.get("refining", 0)
                 result.t_overhead = timings.get("_overhead", 0)
-                # loading_models is part of overhead
-                result.t_overhead += timings.get("loading_models", 0)
 
                 # Count segments from result JSON
                 if data.get("result"):
@@ -217,7 +213,7 @@ def send_async_request(
                         pass
 
                 print(f"  [{label}] COMPLETED in {result.total_time:.1f}s "
-                      f"(ASR={result.t_transcribe:.1f}s Align={result.t_align:.1f}s "
+                      f"(ASR={result.t_transcribe:.1f}s "
                       f"Refine={result.t_refine:.1f}s refined={result.refined})",
                       flush=True)
                 break
@@ -352,17 +348,17 @@ def main():
     print("=" * 70)
 
     hdr = (f"{'Duration':<10} {'Audio':<8} {'Total':<8} {'ASR':<8} "
-           f"{'Align':<8} {'Refine':<8} {'Other':<8} {'RTF':<7} "
+           f"{'Refine':<8} {'Other':<8} {'RTF':<7} "
            f"{'Segs':<6} {'Chunks':<7} {'Refined':<8} {'Status'}")
-    print(f"\n## Sequential (LLM refinement ON)")
+    print("\n## Sequential (LLM refinement ON)")
     print(hdr)
     print("-" * 110)
     for r in sequential_results:
         rtf = r.total_time / r.duration_sec if r.duration_sec > 0 else 0
-        other = r.total_time - r.t_transcribe - r.t_align - r.t_refine
+        other = r.total_time - r.t_transcribe - r.t_refine
         print(
             f"{r.label:<10} {r.duration_sec:<8.0f} {r.total_time:<8.1f} "
-            f"{r.t_transcribe:<8.1f} {r.t_align:<8.1f} {r.t_refine:<8.1f} "
+            f"{r.t_transcribe:<8.1f} {r.t_refine:<8.1f} "
             f"{other:<8.1f} {rtf:<7.3f} {r.segments_count:<6} "
             f"{r.chunks_total:<7} {str(r.refined):<8} {r.status}"
         )
@@ -370,7 +366,7 @@ def main():
     if queue_results:
         print(f"\n## Concurrent Queue Test "
               f"({QUEUE_TEST_COUNT} x {QUEUE_TEST_DURATION // 60}min, refine=ON)")
-        print(f"{'Label':<10} {'Total':<8} {'ASR':<8} {'Align':<8} "
+        print(f"{'Label':<10} {'Total':<8} {'ASR':<8} "
               f"{'Refine':<8} {'Status':<8} {'Queue Positions':<35} {'Job ID'}")
         print("-" * 105)
 
@@ -380,7 +376,7 @@ def main():
             jid = r.job_id[:8] if r.job_id else "N/A"
             print(
                 f"{r.label:<10} {r.total_time:<8.1f} {r.t_transcribe:<8.1f} "
-                f"{r.t_align:<8.1f} {r.t_refine:<8.1f} {r.status:<8} "
+                f"{r.t_refine:<8.1f} {r.status:<8} "
                 f"{positions:<35} {jid}"
             )
 
@@ -409,7 +405,6 @@ def main():
                 "duration_sec": r.duration_sec,
                 "total_time_sec": r.total_time,
                 "t_transcribe": r.t_transcribe,
-                "t_align": r.t_align,
                 "t_refine": r.t_refine,
                 "t_overhead": r.t_overhead,
                 "rtf": r.total_time / r.duration_sec if r.duration_sec > 0 else 0,
@@ -427,7 +422,6 @@ def main():
                 "label": r.label,
                 "total_time_sec": r.total_time,
                 "t_transcribe": r.t_transcribe,
-                "t_align": r.t_align,
                 "t_refine": r.t_refine,
                 "status": r.status,
                 "refined": r.refined,

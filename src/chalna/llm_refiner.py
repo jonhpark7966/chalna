@@ -117,9 +117,12 @@ def build_refinement_prompt(
 ⚠️분리필요 표시가 있는 세그먼트(5초 이상)는 반드시 |SPLIT| 마커로 분리하세요.
 - 자막은 한 번에 3-4초 분량이 적당합니다
 - 문장이 하나라도 의미 단위, 쉼표, 접속사(그래서, 근데, 그리고 등)에서 분리하세요
-- 예1: "첫 번째 문장입니다. 두 번째 문장입니다." → "첫 번째 문장입니다. |SPLIT| 두 번째 문장입니다."
-- 예2: "이건 긴 문장인데 중간에 쉬어가면서 말하는 거예요." → "이건 긴 문장인데 |SPLIT| 중간에 쉬어가면서 말하는 거예요."
-- 예3: "그래서 이렇게 하면 되고 저렇게도 할 수 있어요." → "그래서 이렇게 하면 되고 |SPLIT| 저렇게도 할 수 있어요."
+- 예1: "첫 번째 문장입니다. 두 번째 문장입니다."
+  → "첫 번째 문장입니다. |SPLIT| 두 번째 문장입니다."
+- 예2: "이건 긴 문장인데 중간에 쉬어가면서 말하는 거예요."
+  → "이건 긴 문장인데 |SPLIT| 중간에 쉬어가면서 말하는 거예요."
+- 예3: "그래서 이렇게 하면 되고 저렇게도 할 수 있어요."
+  → "그래서 이렇게 하면 되고 |SPLIT| 저렇게도 할 수 있어요."
 
 ## 출력 형식
 - 입력과 동일한 개수의 JSON 배열 반환
@@ -193,7 +196,10 @@ def parse_refinement_response(
 
         # Validate array length
         if len(data) != len(original_segments):
-            parse_error = f"Array length mismatch: expected {len(original_segments)}, got {len(data)}"
+            parse_error = (
+                f"Array length mismatch: expected {len(original_segments)}, "
+                f"got {len(data)}"
+            )
 
         results = []
         for i, orig_seg in enumerate(original_segments):
@@ -209,7 +215,10 @@ def parse_refinement_response(
                 item = data[i]
                 # Validate: if response has index field, warn about mismatch
                 if item and item.get("index") is not None and item.get("index") != i + 1:
-                    parse_error = f"Index mismatch at position {i}: expected {i + 1}, got {item.get('index')}"
+                    parse_error = (
+                        f"Index mismatch at position {i}: expected {i + 1}, "
+                        f"got {item.get('index')}"
+                    )
 
             if item is None:
                 # No matching item, keep original
@@ -234,7 +243,10 @@ def parse_refinement_response(
                     refined_text=orig_seg.text,
                     split_texts=None,
                     needs_realignment=False,
-                    parse_error=f"Length mismatch: orig={orig_len}, new={new_len}, keeping original",
+                    parse_error=(
+                        f"Length mismatch: orig={orig_len}, new={new_len}, "
+                        "keeping original"
+                    ),
                 ))
                 continue
 
@@ -279,7 +291,13 @@ def _process_single_chunk(
     context: Optional[str],
     chunk_idx: int,
     chunk_size: int,
-) -> Tuple[int, List[Segment], Optional[List[RefinementResult]], Optional[str], Optional[Exception]]:
+) -> Tuple[
+    int,
+    List[Segment],
+    Optional[List[RefinementResult]],
+    Optional[str],
+    Optional[Exception],
+]:
     """
     Process a single chunk through LLM refinement.
 

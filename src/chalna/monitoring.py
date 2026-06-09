@@ -47,7 +47,12 @@ def init_sentry(
     sentry_sdk.set_tag("service", service_name)
 
 
-def capture_job_exception(exc: BaseException, *, job_id: str | None, context: dict[str, Any] | None = None) -> None:
+def capture_job_exception(
+    exc: BaseException,
+    *,
+    job_id: str | None,
+    context: dict[str, Any] | None = None,
+) -> None:
     """Capture background job failures with job-specific context."""
     with sentry_sdk.new_scope() as scope:
         scope.set_tag("service", "chalna")

@@ -23,7 +23,6 @@ from chalna.exceptions import (
     UnsupportedFormatError,
 )
 
-
 # Maximum audio duration in seconds (10 hours)
 MAX_DURATION_SECONDS = 36000
 

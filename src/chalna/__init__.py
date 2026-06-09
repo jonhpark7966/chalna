@@ -1,7 +1,7 @@
 """
 Chalna (찰나) - SRT subtitle generation service.
 
-VibeVoice API + Qwen Forced Alignment for accurate timestamps and speaker diarization.
+ElevenLabs Scribe v2 transcription with optional LLM subtitle refinement.
 """
 
 __version__ = "0.1.0"
@@ -11,6 +11,7 @@ from chalna.exceptions import (
     ChalnaError,
     CorruptedFileError,
     DiskSpaceError,
+    ElevenLabsAPIError,
     EmptyTranscriptionError,
     ErrorCode,
     FFmpegNotFoundError,
@@ -23,7 +24,7 @@ from chalna.exceptions import (
     UnsupportedFormatError,
     VibevoiceAPIError,
 )
-from chalna.models import Segment, TranscriptionResult
+from chalna.models import ScribeOptions, Segment, TranscriptionResult
 from chalna.pipeline import ChalnaPipeline
 
 __all__ = [
@@ -31,6 +32,7 @@ __all__ = [
     "ChalnaPipeline",
     # Models
     "Segment",
+    "ScribeOptions",
     "TranscriptionResult",
     # Exceptions
     "ChalnaError",
@@ -45,6 +47,7 @@ __all__ = [
     "ModelLoadError",
     "ModelDownloadError",
     "VibevoiceAPIError",
+    "ElevenLabsAPIError",
     "DiskSpaceError",
     "TempFileError",
     "FFmpegNotFoundError",

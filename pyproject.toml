@@ -5,19 +5,16 @@ build-backend = "hatchling.build"
 [project]
 name = "chalna"
 version = "0.1.0"
-description = "SRT subtitle generation service with speaker diarization (VibeVoice ASR + Qwen Forced Alignment)"
+description = "SRT subtitle generation service with ElevenLabs Scribe v2 and optional LLM refinement"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 authors = [
     { name = "jonhpark" }
 ]
-keywords = ["asr", "srt", "subtitle", "speech-to-text", "forced-alignment"]
+keywords = ["asr", "srt", "subtitle", "speech-to-text", "scribe"]
 
 dependencies = [
-    "torch>=2.0",
-    "transformers>=4.35",
-    "numpy",
     "fastapi>=0.104.0",
     "uvicorn[standard]>=0.24.0",
     "python-multipart>=0.0.6",
@@ -26,9 +23,6 @@ dependencies = [
     "httpx>=0.25.0",
     "pydantic>=2.5.0",
     "pydantic-settings>=2.1.0",
-    "huggingface-hub>=0.20.0",
-    "librosa>=0.10.0",
-    "soundfile>=0.12.0",
     "sentry-sdk[fastapi]>=2.0.0",
 ]
 
@@ -48,12 +42,12 @@ packages = ["src/chalna"]
 [tool.hatch.build.targets.sdist]
 include = [
     "/src",
-    "/external",
 ]
 
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+exclude = ["external"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W"]

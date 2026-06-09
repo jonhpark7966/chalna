@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "chalna"
 version = "0.1.0"
-description = "SRT subtitle generation service with ElevenLabs Scribe v2 and optional LLM refinement"
+description = "SRT subtitle generation service with ElevenLabs Scribe v2 and optional LLM segmentation/refinement"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"

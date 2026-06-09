@@ -201,3 +201,6 @@ def scribe_response_to_segments(
         words_by_segment_index=reindexed_words,
         language_code=str(language_code) if language_code else None,
     )
+
+
+fallback_scribe_response_to_segments = scribe_response_to_segments

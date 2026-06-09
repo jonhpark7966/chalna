@@ -29,7 +29,7 @@ from chalna.exceptions import (
     TempFileError,
     UnsupportedFormatError,
 )
-from chalna.models import ScribeOptions
+from chalna.models import LlmSegmentationOptions, ScribeOptions
 
 app = typer.Typer(
     name="chalna",
@@ -76,6 +76,11 @@ def transcribe(
         True,
         "--llm-refine/--no-llm-refine",
         help="Use LLM to refine Scribe subtitles (requires Codex CLI)",
+    ),
+    llm_segmentation: bool = typer.Option(
+        True,
+        "--llm-segmentation/--no-llm-segmentation",
+        help="Use LLM to plan Scribe word-to-subtitle segment boundaries",
     ),
     diarize: bool = typer.Option(
         True,
@@ -151,6 +156,7 @@ def transcribe(
                 device=device,
                 use_alignment=False,
                 use_llm_refinement=llm_refine,
+                use_llm_segmentation=llm_segmentation,
             )
 
             progress.update(task, description="Transcribing audio...")
@@ -166,6 +172,7 @@ def transcribe(
                     tag_audio_events=tag_audio_events,
                     num_speakers=num_speakers,
                 ),
+                llm_segmentation_options=LlmSegmentationOptions(enabled=llm_segmentation),
             )
 
             progress.update(task, description="Writing output...")

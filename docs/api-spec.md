@@ -5,7 +5,7 @@
 | Item | Value |
 |------|-------|
 | Title | Chalna (찰나) |
-| Description | SRT subtitle generation service with ElevenLabs Scribe v2 |
+| Description | SRT subtitle generation service with ElevenLabs Scribe v2 and optional LLM segmentation/refinement |
 | Version | `0.1.0` |
 | Default Port | `7861` |
 | Base URL | `http://localhost:7861` |
@@ -15,12 +15,13 @@
 ```text
 validating
  -> scribe_v2 transcribe
+ -> optional LLM segment plan
  -> optional LLM refine
  -> timestamp overlap cleanup only
  -> SRT/JSON 저장
 ```
 
-Qwen forced aligner is not executed. `use_alignment` remains accepted for backward compatibility but is ignored.
+Qwen forced aligner is not executed. `use_alignment` remains accepted for backward compatibility but is ignored. LLM segmentation plans word index ranges only; timestamps always come from Scribe word timestamps.
 
 ## Common Error Response
 
@@ -76,6 +77,7 @@ Multipart form parameters:
 | `diarize` | bool | true | No | Enable Scribe speaker diarization |
 | `tag_audio_events` | bool | true | No | Include Scribe audio event tags |
 | `num_speakers` | int | null | No | Expected speaker count, 1-32 |
+| `use_llm_segmentation` | bool | true | No | Plan Scribe word-to-segment boundaries with LLM |
 | `use_llm_refinement` | bool | true | No | Refine Scribe output with LLM |
 | `use_alignment` | bool | ignored | No | Deprecated; ignored |
 | `output_format` | string | `srt` | No | `srt` or `json` |
@@ -111,7 +113,8 @@ JSON response:
     "model_version": "scribe_v2",
     "aligned": false,
     "refined": true,
-    "timestamp_source": "scribe_v2"
+    "timestamp_source": "scribe_v2",
+    "segmentation_source": "llm"
   }
 }
 ```
@@ -122,6 +125,7 @@ When `include_intermediate=true`, JSON may include:
 |-------|------|-------------|
 | `raw_srt` | string \| null | Raw Scribe v2 result converted to SRT |
 | `refined_srt` | string \| null | LLM-refined result as SRT |
+| `segmentation_log` | list \| null | LLM segmentation cache/planning/fallback log when logs are requested |
 
 ### `POST /transcribe/async`
 
@@ -187,6 +191,14 @@ The cache key is based on audio metadata and Scribe request options:
 - diarize, tag_audio_events, num_speakers
 - timestamps granularity
 
+LLM segmentation plans are stored under:
+
+```text
+results/segment_cache/{cache_key}.json
+```
+
+The segment cache key includes the Scribe cache key, LLM model, reasoning effort, prompt version, language code, Scribe options, and segmentation options.
+
 ## Errors
 
 | Code | Type | HTTP | Condition |
@@ -197,7 +209,7 @@ The cache key is based on audio metadata and Scribe request options:
 | E1004 | `FileTooLargeError` | 400 | File size > 2GB |
 | E1005 | `FilePermissionError` | 400 | Cannot read file |
 | E2002 | `EmptyTranscriptionError` | 200 | No speech detected |
-| E3002 | `CodexAPIError` | 503 | Codex CLI refinement failed |
+| E3002 | `CodexAPIError` | 503 | Codex CLI segmentation/refinement failed |
 | E3003 | `CodexRateLimitError` | 429 | Codex API rate limit |
 | E3005 | `ElevenLabsAPIError` | 503 | ElevenLabs Scribe request failed |
 | E4001 | `DiskSpaceError` | 503 | Insufficient disk space |

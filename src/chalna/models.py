@@ -29,6 +29,32 @@ class ScribeOptions:
 
 
 @dataclass
+class LlmSegmentationOptions:
+    """Options for LLM-based word boundary planning."""
+
+    enabled: bool = True
+    model: str = "gpt-5.5"
+    reasoning_effort: str = "xhigh"
+    max_segment_duration: float = 5.0
+    max_words_per_call: int = 180
+
+    def __post_init__(self) -> None:
+        if self.max_segment_duration <= 0:
+            raise ValueError("max_segment_duration must be greater than 0")
+        if self.max_words_per_call < 20:
+            raise ValueError("max_words_per_call must be at least 20")
+
+    def to_dict(self) -> dict:
+        return {
+            "enabled": self.enabled,
+            "model": self.model,
+            "reasoning_effort": self.reasoning_effort,
+            "max_segment_duration": self.max_segment_duration,
+            "max_words_per_call": self.max_words_per_call,
+        }
+
+
+@dataclass
 class Segment:
     """A single transcription segment."""
 
@@ -65,6 +91,7 @@ class TranscriptionMetadata:
     aligned: bool = False  # whether external forced alignment was applied
     refined: bool = True  # whether LLM refinement was applied
     timestamp_source: Optional[str] = None
+    segmentation_source: Optional[str] = None
 
     def to_dict(self) -> dict:
         result = {
@@ -77,6 +104,8 @@ class TranscriptionMetadata:
         }
         if self.timestamp_source is not None:
             result["timestamp_source"] = self.timestamp_source
+        if self.segmentation_source is not None:
+            result["segmentation_source"] = self.segmentation_source
         return result
 
 
@@ -94,6 +123,7 @@ class IntermediateResults:
     chunk_raw_segments: Optional[List[List[Segment]]] = None
     # Logs
     alignment_log: Optional[List[dict]] = None
+    segmentation_log: Optional[List[dict]] = None
     refinement_log: Optional[List[dict]] = None
 
     def to_dict(self) -> dict:
@@ -110,6 +140,8 @@ class IntermediateResults:
             ]
         if self.alignment_log:
             result["alignment_log"] = self.alignment_log
+        if self.segmentation_log:
+            result["segmentation_log"] = self.segmentation_log
         if self.refinement_log:
             result["refinement_log"] = self.refinement_log
         return result

@@ -53,6 +53,7 @@ def test_pipeline_uses_cache_and_skips_llm_when_disabled(tmp_path: Path, monkeyp
     cache = ScribeResponseCache(tmp_path / "cache")
     pipeline = ChalnaPipeline(
         use_llm_refinement=False,
+        use_llm_segmentation=False,
         scribe_client=fake_client,
         scribe_cache=cache,
     )
@@ -65,6 +66,7 @@ def test_pipeline_uses_cache_and_skips_llm_when_disabled(tmp_path: Path, monkeyp
     assert first.metadata.aligned is False
     assert first.metadata.refined is False
     assert first.metadata.timestamp_source == "scribe_v2"
+    assert first.metadata.segmentation_source == "heuristic"
     assert second.segments[0].text == "안녕하세요 반갑습니다."
 
 
@@ -105,6 +107,7 @@ def test_pipeline_llm_refinement_never_uses_qwen_aligner(tmp_path: Path, monkeyp
     monkeypatch.setattr("chalna.llm_refiner.refine_segments", fake_refine_segments)
     pipeline = ChalnaPipeline(
         use_llm_refinement=True,
+        use_llm_segmentation=False,
         scribe_client=FakeScribeClient(),
         scribe_cache=ScribeResponseCache(tmp_path / "cache"),
     )
@@ -117,3 +120,27 @@ def test_pipeline_llm_refinement_never_uses_qwen_aligner(tmp_path: Path, monkeyp
     assert result.segments[0].start_time == 0.0
     assert result.segments[0].end_time == 0.5
     assert result.segments[1].start_time == 0.55
+
+
+def test_pipeline_falls_back_to_heuristic_when_llm_segmentation_fails(tmp_path: Path, monkeypatch):
+    _patch_audio_validation(monkeypatch)
+    audio_path = tmp_path / "source.mp4"
+    audio_path.write_bytes(b"media")
+
+    class BrokenSegmenter:
+        def segment(self, *args, **kwargs):
+            raise ValueError("bad LLM plan")
+
+    pipeline = ChalnaPipeline(
+        use_llm_refinement=False,
+        use_llm_segmentation=True,
+        scribe_client=FakeScribeClient(),
+        scribe_cache=ScribeResponseCache(tmp_path / "cache"),
+        llm_segmenter=BrokenSegmenter(),
+    )
+
+    result = pipeline.transcribe(audio_path, language="ko")
+
+    assert result.metadata.segmentation_source == "heuristic"
+    assert result.intermediate.segmentation_log[0]["status"] == "fallback"
+    assert result.segments[0].text == "안녕하세요 반갑습니다."

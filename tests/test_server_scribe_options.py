@@ -1,7 +1,7 @@
 import pytest
 from fastapi import HTTPException
 
-from chalna.server import _make_scribe_options
+from chalna.server import _make_llm_segmentation_options, _make_scribe_options
 
 
 def test_make_scribe_options_from_api_form_values():
@@ -25,3 +25,11 @@ def test_make_scribe_options_rejects_invalid_num_speakers():
         )
 
     assert exc_info.value.status_code == 400
+
+
+def test_make_llm_segmentation_options_from_api_form_value():
+    options = _make_llm_segmentation_options(use_llm_segmentation=False)
+
+    assert options.enabled is False
+    assert options.model
+    assert options.reasoning_effort

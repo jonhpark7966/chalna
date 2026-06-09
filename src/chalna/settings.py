@@ -8,6 +8,7 @@ from pydantic_settings import BaseSettings
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_SCRIBE_CACHE_DIR = _PROJECT_ROOT / "results" / "scribe_cache"
+_DEFAULT_SEGMENT_CACHE_DIR = _PROJECT_ROOT / "results" / "segment_cache"
 
 
 class Settings(BaseSettings):
@@ -37,6 +38,34 @@ class Settings(BaseSettings):
     scribe_timeout: float = Field(
         default=600.0,
         validation_alias=AliasChoices("CHALNA_SCRIBE_TIMEOUT", "SCRIBE_TIMEOUT"),
+    )
+    llm_segmentation_cache_dir: str = Field(
+        default=str(_DEFAULT_SEGMENT_CACHE_DIR),
+        validation_alias=AliasChoices(
+            "CHALNA_LLM_SEGMENTATION_CACHE_DIR",
+            "LLM_SEGMENTATION_CACHE_DIR",
+        ),
+    )
+    llm_segmentation_model: str = Field(
+        default="gpt-5.5",
+        validation_alias=AliasChoices(
+            "CHALNA_LLM_SEGMENTATION_MODEL",
+            "LLM_SEGMENTATION_MODEL",
+        ),
+    )
+    llm_segmentation_reasoning_effort: str = Field(
+        default="xhigh",
+        validation_alias=AliasChoices(
+            "CHALNA_LLM_SEGMENTATION_REASONING_EFFORT",
+            "LLM_SEGMENTATION_REASONING_EFFORT",
+        ),
+    )
+    llm_segmentation_timeout: int = Field(
+        default=180,
+        validation_alias=AliasChoices(
+            "CHALNA_LLM_SEGMENTATION_TIMEOUT",
+            "LLM_SEGMENTATION_TIMEOUT",
+        ),
     )
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}

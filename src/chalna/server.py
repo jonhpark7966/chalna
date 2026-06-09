@@ -27,7 +27,7 @@ from chalna.db import init_db, migrate_from_results_dir
 from chalna.db import list_jobs as db_list_jobs
 from chalna.db import save_job as db_save_job
 from chalna.exceptions import ChalnaError
-from chalna.models import ScribeOptions
+from chalna.models import LlmSegmentationOptions, ScribeOptions
 from chalna.monitoring import capture_job_exception, init_sentry
 from chalna.settings import settings
 from chalna.validation import validate_audio_file
@@ -129,6 +129,14 @@ def _make_scribe_options(
         raise HTTPException(status_code=400, detail=str(e)) from e
 
 
+def _make_llm_segmentation_options(*, use_llm_segmentation: bool) -> LlmSegmentationOptions:
+    return LlmSegmentationOptions(
+        enabled=use_llm_segmentation,
+        model=settings.llm_segmentation_model,
+        reasoning_effort=settings.llm_segmentation_reasoning_effort,
+    )
+
+
 def get_pipeline():
     """Get or create pipeline instance."""
     global _pipeline
@@ -173,6 +181,8 @@ def _estimate_job_duration(job: "Job") -> float:
 
     duration = job.audio_duration
     rate = _performance_stats["asr_rate"]
+    if job.use_llm_segmentation:
+        rate += _performance_stats["refine_rate"]
     if job.use_llm_refinement:
         rate += _performance_stats["refine_rate"]
 
@@ -315,6 +325,7 @@ class Job(BaseModel):
     error_details: Optional[Dict[str, Any]] = None
     output_format: str = "srt"
     alignment_log: Optional[List[dict]] = None
+    segmentation_log: Optional[List[dict]] = None
     refinement_log: Optional[List[dict]] = None
     progress_history: List[Dict[str, Any]] = Field(default_factory=list)
     # Intermediate results
@@ -330,6 +341,7 @@ class Job(BaseModel):
     # ETA estimation
     audio_duration: Optional[float] = None  # seconds
     use_alignment: bool = False
+    use_llm_segmentation: bool = True
     use_llm_refinement: bool = True
 
 
@@ -364,6 +376,7 @@ class JobResponse(BaseModel):
     error: Optional[str] = None
     error_details: Optional[Dict[str, Any]] = None
     alignment_log: Optional[List[dict]] = None
+    segmentation_log: Optional[List[dict]] = None
     refinement_log: Optional[List[dict]] = None
     progress_history: List[Dict[str, Any]] = Field(default_factory=list)
     # Intermediate results
@@ -599,6 +612,10 @@ async def transcribe(
     language: Optional[str] = Form(None, description="Language hint (ko, en, ja, zh)"),
     include_speaker: bool = Form(True, description="Include speaker labels"),
     use_alignment: bool = Form(True, description="Deprecated; ignored"),
+    use_llm_segmentation: bool = Form(
+        True,
+        description="Plan Scribe word-to-segment boundaries with LLM",
+    ),
     use_llm_refinement: bool = Form(True, description="Refine Scribe output with LLM"),
     diarize: bool = Form(True, description="Enable Scribe speaker diarization"),
     tag_audio_events: bool = Form(True, description="Tag non-speech audio events"),
@@ -654,6 +671,7 @@ async def transcribe(
         output_format=output_format,
         audio_duration=audio_info.duration_seconds,
         use_alignment=False,
+        use_llm_segmentation=use_llm_segmentation,
         use_llm_refinement=use_llm_refinement,
     )
     _jobs[job_id] = job
@@ -664,6 +682,7 @@ async def transcribe(
         language=language,
         include_speaker=include_speaker,
         use_alignment=use_alignment,
+        use_llm_segmentation=use_llm_segmentation,
         use_llm_refinement=use_llm_refinement,
         diarize=diarize,
         tag_audio_events=tag_audio_events,
@@ -711,6 +730,10 @@ async def transcribe_async(
     language: Optional[str] = Form(None, description="Language hint (ko, en, ja, zh)"),
     include_speaker: bool = Form(True, description="Include speaker labels"),
     use_alignment: bool = Form(True, description="Deprecated; ignored"),
+    use_llm_segmentation: bool = Form(
+        True,
+        description="Plan Scribe word-to-segment boundaries with LLM",
+    ),
     use_llm_refinement: bool = Form(True, description="Refine Scribe output with LLM"),
     diarize: bool = Form(True, description="Enable Scribe speaker diarization"),
     tag_audio_events: bool = Form(True, description="Tag non-speech audio events"),
@@ -757,6 +780,7 @@ async def transcribe_async(
         output_format=output_format,
         audio_duration=audio_info.duration_seconds,
         use_alignment=False,
+        use_llm_segmentation=use_llm_segmentation,
         use_llm_refinement=use_llm_refinement,
     )
     _jobs[job_id] = job
@@ -768,6 +792,7 @@ async def transcribe_async(
         language=language,
         include_speaker=include_speaker,
         use_alignment=use_alignment,
+        use_llm_segmentation=use_llm_segmentation,
         use_llm_refinement=use_llm_refinement,
         diarize=diarize,
         tag_audio_events=tag_audio_events,
@@ -876,6 +901,7 @@ async def get_job(job_id: str):
             error=job.error,
             error_details=job.error_details,
             alignment_log=job.alignment_log,
+            segmentation_log=job.segmentation_log,
             refinement_log=job.refinement_log,
             progress_history=job.progress_history,
             raw_srt=job.raw_srt,
@@ -980,6 +1006,7 @@ async def _process_job(
     language: Optional[str],
     include_speaker: bool,
     use_alignment: bool,
+    use_llm_segmentation: bool,
     use_llm_refinement: bool,
     diarize: bool,
     tag_audio_events: bool,
@@ -1009,9 +1036,10 @@ async def _process_job(
         # Map stage progress to overall job progress
         # Weights match actual pipeline order:
         # validating → transcribing → optional refining
+        transcribing_end = 0.80 if use_llm_refinement else 0.95
         stage_weights = {
             "validating": (0.0, 0.05),
-            "transcribing": (0.05, 0.80 if use_llm_refinement else 0.95),
+            "transcribing": (0.05, transcribing_end),
             "refining": (0.80, 0.95),
         }
         if stage in stage_weights:
@@ -1038,11 +1066,15 @@ async def _process_job(
         # Get pipeline
         pipeline = get_pipeline()
         pipeline.use_alignment = False
+        pipeline.use_llm_segmentation = use_llm_segmentation
         pipeline.use_llm_refinement = use_llm_refinement
         scribe_options = _make_scribe_options(
             diarize=diarize,
             tag_audio_events=tag_audio_events,
             num_speakers=num_speakers,
+        )
+        llm_segmentation_options = _make_llm_segmentation_options(
+            use_llm_segmentation=use_llm_segmentation,
         )
 
         # Run transcription (in thread pool to not block)
@@ -1055,6 +1087,7 @@ async def _process_job(
                 language=language,
                 progress_callback=progress_callback,
                 scribe_options=scribe_options,
+                llm_segmentation_options=llm_segmentation_options,
             )
         )
 
@@ -1063,6 +1096,7 @@ async def _process_job(
         # Include logs if requested (use result.intermediate for thread safety)
         if include_logs and result.intermediate:
             job.alignment_log = result.intermediate.alignment_log
+            job.segmentation_log = result.intermediate.segmentation_log
             job.refinement_log = result.intermediate.refinement_log
 
         # Include intermediate results if requested
@@ -1091,6 +1125,7 @@ async def _process_job(
             result_data = result.to_dict()
             if include_logs:
                 result_data["alignment_log"] = job.alignment_log
+                result_data["segmentation_log"] = job.segmentation_log
                 result_data["refinement_log"] = job.refinement_log
             if include_intermediate:
                 result_data["raw_srt"] = job.raw_srt
@@ -1124,6 +1159,7 @@ async def _process_job(
                     "audio_path": str(audio_path),
                     "language": language,
                     "use_alignment": use_alignment,
+                    "use_llm_segmentation": use_llm_segmentation,
                     "use_llm_refinement": use_llm_refinement,
                 },
             )
@@ -1231,6 +1267,7 @@ def _save_job_results(job: Job, result, include_speaker: bool) -> None:
         if result.intermediate:
             json_data["intermediate"] = {
                 "alignment_log": result.intermediate.alignment_log,
+                "segmentation_log": result.intermediate.segmentation_log,
                 "refinement_log": result.intermediate.refinement_log,
             }
 

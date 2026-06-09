@@ -12,14 +12,21 @@ from chalna.exceptions import (
 )
 from chalna.models import (
     IntermediateResults,
+    LlmSegmentationOptions,
     ScribeOptions,
     Segment,
     TranscriptionMetadata,
     TranscriptionResult,
 )
 from chalna.scribe_adapter import scribe_response_to_segments
-from chalna.scribe_cache import ScribeResponseCache, build_scribe_cache_metadata
+from chalna.scribe_cache import (
+    ScribeResponseCache,
+    build_scribe_cache_key,
+    build_scribe_cache_metadata,
+)
 from chalna.scribe_client import ScribeClient
+from chalna.scribe_llm_segmenter import LlmScribeSegmenter
+from chalna.segment_cache import SegmentPlanCache
 from chalna.settings import settings
 from chalna.validation import (
     check_disk_space,
@@ -37,19 +44,26 @@ class ChalnaPipeline:
         dtype: object = None,
         use_alignment: bool = True,
         use_llm_refinement: bool = True,
+        use_llm_segmentation: bool = True,
         aligner_path: str = "",
         scribe_client: Optional[ScribeClient] = None,
         scribe_cache: Optional[ScribeResponseCache] = None,
+        llm_segmenter: Optional[LlmScribeSegmenter] = None,
+        segment_cache: Optional[SegmentPlanCache] = None,
     ):
         # Kept for constructor compatibility. Qwen alignment is intentionally disabled.
         self.device = device
         self.dtype = dtype
         self.use_alignment = False
         self.use_llm_refinement = use_llm_refinement
+        self.use_llm_segmentation = use_llm_segmentation
         self.aligner_path = aligner_path
 
         self.scribe_client = scribe_client or ScribeClient()
         self.scribe_cache = scribe_cache or ScribeResponseCache(settings.scribe_cache_dir)
+        self.llm_segmenter = llm_segmenter or LlmScribeSegmenter(
+            cache=segment_cache or SegmentPlanCache(settings.llm_segmentation_cache_dir)
+        )
 
         self._auto_unload = False
         self._last_alignment_log: list[dict] = []
@@ -58,6 +72,7 @@ class ChalnaPipeline:
         self._aligned_segments: Optional[list[Segment]] = None
         self._refined_segments: Optional[list[Segment]] = None
         self._refinement_log: Optional[list[dict]] = None
+        self._segmentation_log: Optional[list[dict]] = None
         self._scribe_words_by_segment_index: dict[int, list[dict]] = {}
         self._last_scribe_response: Optional[dict] = None
 
@@ -82,6 +97,7 @@ class ChalnaPipeline:
         verbose: bool = True,
         progress_callback: Optional[Callable[[str, float], None]] = None,
         scribe_options: Optional[ScribeOptions] = None,
+        llm_segmentation_options: Optional[LlmSegmentationOptions] = None,
     ) -> TranscriptionResult:
         """Transcribe an audio/video file to Chalna segments and subtitles."""
         del max_new_tokens  # Kept for compatibility with the previous local ASR API.
@@ -92,6 +108,8 @@ class ChalnaPipeline:
 
         self._reset_request_state()
         options = scribe_options or ScribeOptions()
+        segmentation_options = llm_segmentation_options or self._default_llm_segmentation_options()
+        segmentation_options.enabled = segmentation_options.enabled and self.use_llm_segmentation
 
         def _progress(stage: str, value: float, **extra):
             if progress_callback:
@@ -112,6 +130,7 @@ class ChalnaPipeline:
             language_code=language,
             options=options,
         )
+        scribe_cache_key = build_scribe_cache_key(cache_metadata)
         scribe_response = self.scribe_cache.get(cache_metadata)
         cache_hit = scribe_response is not None
         if scribe_response is None:
@@ -123,12 +142,19 @@ class ChalnaPipeline:
             self.scribe_cache.put(cache_metadata, scribe_response)
 
         self._last_scribe_response = scribe_response
-        adapter_result = scribe_response_to_segments(
-            scribe_response,
-            include_audio_events=options.tag_audio_events,
+        _progress("transcribing", 0.65, cache_hit=cache_hit)
+
+        segments, words_by_segment_index, language_code, segmentation_source = (
+            self._segments_from_scribe_response(
+                response=scribe_response,
+                scribe_cache_key=scribe_cache_key,
+                language=language,
+                context=context,
+                scribe_options=options,
+                segmentation_options=segmentation_options,
+            )
         )
-        segments = adapter_result.segments
-        self._scribe_words_by_segment_index = adapter_result.words_by_segment_index
+        self._scribe_words_by_segment_index = words_by_segment_index
 
         if not segments:
             raise EmptyTranscriptionError(audio_duration=audio_info.duration_seconds)
@@ -158,7 +184,7 @@ class ChalnaPipeline:
             segment.index = i
 
         speakers = sorted({s.speaker_id for s in segments if s.speaker_id})
-        result_language = adapter_result.language_code or language
+        result_language = language_code or language
 
         metadata = TranscriptionMetadata(
             duration=audio_info.duration_seconds,
@@ -168,6 +194,7 @@ class ChalnaPipeline:
             aligned=False,
             refined=self.use_llm_refinement and self._refined_segments is not None,
             timestamp_source=self.scribe_client.model_id,
+            segmentation_source=segmentation_source,
         )
 
         intermediate = IntermediateResults(
@@ -176,6 +203,7 @@ class ChalnaPipeline:
             refined_segments=self._refined_segments,
             chunk_raw_segments=None,
             alignment_log=[],
+            segmentation_log=self._segmentation_log,
             refinement_log=self._refinement_log,
         )
 
@@ -192,6 +220,10 @@ class ChalnaPipeline:
     def get_alignment_log(self) -> list[dict]:
         """Qwen alignment is disabled; this always returns an empty log."""
         return self._last_alignment_log
+
+    def get_segmentation_log(self) -> Optional[list[dict]]:
+        """Get LLM word boundary planning log."""
+        return self._segmentation_log
 
     def get_raw_segments(self) -> Optional[list[Segment]]:
         """Get raw Scribe segments before optional LLM refinement."""
@@ -224,10 +256,73 @@ class ChalnaPipeline:
         self._aligned_segments = None
         self._refined_segments = None
         self._refinement_log = None
+        self._segmentation_log = None
         self._last_alignment_log = []
         self._pre_alignment_segments = None
         self._scribe_words_by_segment_index = {}
         self._last_scribe_response = None
+
+    def _default_llm_segmentation_options(self) -> LlmSegmentationOptions:
+        return LlmSegmentationOptions(
+            enabled=self.use_llm_segmentation,
+            model=settings.llm_segmentation_model,
+            reasoning_effort=settings.llm_segmentation_reasoning_effort,
+        )
+
+    def _segments_from_scribe_response(
+        self,
+        *,
+        response: dict,
+        scribe_cache_key: str,
+        language: Optional[str],
+        context: Optional[str],
+        scribe_options: ScribeOptions,
+        segmentation_options: LlmSegmentationOptions,
+    ) -> tuple[list[Segment], dict[int, list[dict]], Optional[str], str]:
+        language_code = response.get("language_code")
+        language_code = str(language_code) if language_code else language
+
+        if segmentation_options.enabled:
+            try:
+                result = self.llm_segmenter.segment(
+                    response,
+                    scribe_cache_key=scribe_cache_key,
+                    language_code=language_code,
+                    context=context,
+                    scribe_options=scribe_options,
+                    segmentation_options=segmentation_options,
+                    include_audio_events=scribe_options.tag_audio_events,
+                )
+                self._segmentation_log = result.log
+                return (
+                    result.segments,
+                    result.words_by_segment_index,
+                    language_code,
+                    "llm",
+                )
+            except (CodexAPIError, CodexRateLimitError, ValueError) as e:
+                self._segmentation_log = [{
+                    "status": "fallback",
+                    "source": "heuristic",
+                    "error": str(e),
+                }]
+
+        adapter_result = scribe_response_to_segments(
+            response,
+            include_audio_events=scribe_options.tag_audio_events,
+        )
+        if self._segmentation_log is None:
+            self._segmentation_log = [{
+                "status": "skipped",
+                "source": "heuristic",
+                "reason": "llm_segmentation_disabled",
+            }]
+        return (
+            adapter_result.segments,
+            adapter_result.words_by_segment_index,
+            adapter_result.language_code or language_code,
+            "heuristic",
+        )
 
     def _run_llm_refinement(
         self,

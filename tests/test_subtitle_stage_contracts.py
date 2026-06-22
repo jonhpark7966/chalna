@@ -25,9 +25,10 @@ def test_align_segments_compatibility_only_fixes_overlaps(tmp_path):
     assert aligned[1].start_time == 1.75
 
 
-def test_llm_text_refinement_parses_split_markers_and_keeps_origin_map(monkeypatch):
+def test_llm_text_refinement_keeps_segment_count_even_with_split_marker(monkeypatch):
     from chalna import llm_refiner
 
+    prompts = []
     response = json.dumps(
         [
             {"index": 1, "text": "첫 문장입니다. |SPLIT| 두 번째 문장입니다."},
@@ -35,7 +36,12 @@ def test_llm_text_refinement_parses_split_markers_and_keeps_origin_map(monkeypat
         ],
         ensure_ascii=False,
     )
-    monkeypatch.setattr(llm_refiner, "call_codex_cli", lambda prompt: response)
+
+    def fake_call_codex_cli(prompt, **kwargs):
+        prompts.append(prompt)
+        return response
+
+    monkeypatch.setattr(llm_refiner, "call_codex_cli", fake_call_codex_cli)
 
     output = llm_refiner.refine_segments(
         [
@@ -46,14 +52,20 @@ def test_llm_text_refinement_parses_split_markers_and_keeps_origin_map(monkeypat
         max_workers=1,
     )
 
+    assert len(prompts) == 1
+    assert "분리필요" not in prompts[0]
+    assert "|SPLIT|" not in prompts[0]
+    assert [entry["status"] for entry in output.log[:3]] == [
+        "refinement_mode",
+        "refined",
+        "refined",
+    ]
     assert [seg.text for seg in output.segments] == [
-        "첫 문장입니다.",
-        "두 번째 문장입니다.",
+        "첫 문장입니다. 두 번째 문장입니다.",
         "맞춤법을 고친 문장입니다.",
     ]
     assert output.segments[0].start_time == 0.0
-    assert output.segments[0].end_time == 3.0
-    assert output.segments[1].start_time == 3.0
-    assert output.segments[1].end_time == 6.0
-    assert output.origin_map == {0: 1, 1: 1, 2: 2}
-    assert [entry["status"] for entry in output.log[:2]] == ["split", "refined"]
+    assert output.segments[0].end_time == 6.0
+    assert output.segments[1].start_time == 6.0
+    assert output.segments[1].end_time == 8.0
+    assert output.origin_map == {0: 1, 1: 2}

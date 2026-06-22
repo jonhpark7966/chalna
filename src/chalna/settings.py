@@ -67,6 +67,13 @@ class Settings(BaseSettings):
             "LLM_SEGMENTATION_TIMEOUT",
         ),
     )
+    llm_refinement_timeout: int = Field(
+        default=900,
+        validation_alias=AliasChoices(
+            "CHALNA_LLM_REFINEMENT_TIMEOUT",
+            "LLM_REFINEMENT_TIMEOUT",
+        ),
+    )
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 

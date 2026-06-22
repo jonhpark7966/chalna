@@ -183,8 +183,6 @@ def scribe_response_to_segments(
             flush_current()
         elif token_text.endswith(PHRASE_ENDINGS) and builder.duration >= max_segment_duration:
             flush_current()
-        elif builder.duration >= max_segment_duration + 1.0:
-            flush_current()
 
     flush_current()
 

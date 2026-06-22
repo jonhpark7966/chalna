@@ -213,6 +213,124 @@ class ChalnaPipeline:
             intermediate=intermediate,
         )
 
+    def transcribe_from_scribe_response(
+        self,
+        audio_path: str | Path,
+        scribe_response: dict,
+        context: Optional[str] = None,
+        language: Optional[str] = None,
+        max_new_tokens: int = 65536,
+        verbose: bool = True,
+        progress_callback: Optional[Callable[[str, float], None]] = None,
+        scribe_options: Optional[ScribeOptions] = None,
+        llm_segmentation_options: Optional[LlmSegmentationOptions] = None,
+    ) -> TranscriptionResult:
+        """Run Chalna segmentation/refinement from a pre-existing raw Scribe response."""
+        del max_new_tokens
+
+        audio_path = Path(audio_path)
+        if not audio_path.exists():
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+        if not isinstance(scribe_response, dict):
+            raise ValueError("scribe_response must be a JSON object")
+
+        self._reset_request_state()
+        options = scribe_options or ScribeOptions()
+        segmentation_options = llm_segmentation_options or self._default_llm_segmentation_options()
+        segmentation_options.enabled = segmentation_options.enabled and self.use_llm_segmentation
+
+        def _progress(stage: str, value: float, **extra):
+            if progress_callback:
+                progress_callback(stage, value, **extra)
+
+        _progress("validating", 0.0)
+        audio_info = validate_audio_file(audio_path)
+        _progress("validating", 1.0)
+
+        required_mb = estimate_temp_space_required(audio_info)
+        check_disk_space(required_mb)
+
+        cache_metadata = build_scribe_cache_metadata(
+            audio_path=audio_path,
+            audio_info=audio_info,
+            model_id=self.scribe_client.model_id,
+            language_code=language,
+            options=options,
+        )
+        scribe_cache_key = build_scribe_cache_key(cache_metadata)
+
+        _progress("transcribing", 0.0, cache_hit=True, source="provided_scribe_response")
+        self._last_scribe_response = scribe_response
+
+        segments, words_by_segment_index, language_code, segmentation_source = (
+            self._segments_from_scribe_response(
+                response=scribe_response,
+                scribe_cache_key=scribe_cache_key,
+                language=language,
+                context=context,
+                scribe_options=options,
+                segmentation_options=segmentation_options,
+            )
+        )
+        self._scribe_words_by_segment_index = words_by_segment_index
+
+        if not segments:
+            raise EmptyTranscriptionError(audio_duration=audio_info.duration_seconds)
+
+        self._raw_segments = self._clone_segments(segments)
+        self._pre_alignment_segments = self._raw_segments
+        _progress("transcribing", 1.0, cache_hit=True, source="provided_scribe_response")
+
+        if self.use_llm_refinement:
+            _progress("refining", 0.0)
+            try:
+                segments, self._refinement_log = self._run_llm_refinement(
+                    segments=segments,
+                    context=context,
+                    progress_callback=progress_callback,
+                    verbose=verbose,
+                )
+                self._refined_segments = self._clone_segments(segments)
+            except (CodexAPIError, CodexRateLimitError) as e:
+                if verbose:
+                    print(f"\nLLM refinement skipped: {e.message}")
+                self._refinement_log = [{"status": "skipped", "error": str(e)}]
+            _progress("refining", 1.0)
+
+        segments = self._fix_overlapping_timestamps(segments, verbose=verbose)
+        for i, segment in enumerate(segments, start=1):
+            segment.index = i
+
+        speakers = sorted({s.speaker_id for s in segments if s.speaker_id})
+        result_language = language_code or language
+
+        metadata = TranscriptionMetadata(
+            duration=audio_info.duration_seconds,
+            language=result_language,
+            speakers=speakers,
+            model_version=self.scribe_client.model_id,
+            aligned=False,
+            refined=self.use_llm_refinement and self._refined_segments is not None,
+            timestamp_source=self.scribe_client.model_id,
+            segmentation_source=segmentation_source,
+        )
+
+        intermediate = IntermediateResults(
+            raw_segments=self._raw_segments,
+            aligned_segments=None,
+            refined_segments=self._refined_segments,
+            chunk_raw_segments=None,
+            alignment_log=[],
+            segmentation_log=self._segmentation_log,
+            refinement_log=self._refinement_log,
+        )
+
+        return TranscriptionResult(
+            segments=segments,
+            metadata=metadata,
+            intermediate=intermediate,
+        )
+
     def get_pre_alignment_segments(self) -> Optional[list[Segment]]:
         """Get segments before optional LLM refinement."""
         return self._pre_alignment_segments

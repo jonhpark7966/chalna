@@ -127,6 +127,7 @@ print(result.to_srt())
 | `tag_audio_events` | bool | true | Scribe audio event 태깅 |
 | `num_speakers` | int | null | 예상 화자 수, 1-32 |
 | `use_llm_segmentation` | bool | true | Scribe words를 LLM word range plan으로 Segment화 |
+| `bypass_llm_segmentation_cache` | bool | false | Segment plan cache read 없이 LLM segmentation 재계산 |
 | `use_llm_refinement` | bool | true | Scribe 이후 LLM 자막 교정 |
 | `use_alignment` | bool | ignored | Deprecated. Qwen forced alignment는 실행되지 않음 |
 | `output_format` | string | srt | 출력 형식 (`srt`, `json`) |

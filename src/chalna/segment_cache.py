@@ -9,7 +9,7 @@ from typing import Any, Optional
 
 from chalna.models import LlmSegmentationOptions, ScribeOptions
 
-SEGMENTATION_PROMPT_VERSION = "scribe_llm_segmenter_v1"
+SEGMENTATION_PROMPT_VERSION = "scribe_llm_segmenter_v5_punctuation_boundary"
 
 
 def build_segment_cache_metadata(

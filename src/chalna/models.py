@@ -37,6 +37,7 @@ class LlmSegmentationOptions:
     reasoning_effort: str = "xhigh"
     max_segment_duration: float = 5.0
     max_words_per_call: int = 180
+    bypass_cache: bool = False
 
     def __post_init__(self) -> None:
         if self.max_segment_duration <= 0:
@@ -51,6 +52,7 @@ class LlmSegmentationOptions:
             "reasoning_effort": self.reasoning_effort,
             "max_segment_duration": self.max_segment_duration,
             "max_words_per_call": self.max_words_per_call,
+            "bypass_cache": self.bypass_cache,
         }
 
 

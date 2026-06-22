@@ -129,11 +129,16 @@ def _make_scribe_options(
         raise HTTPException(status_code=400, detail=str(e)) from e
 
 
-def _make_llm_segmentation_options(*, use_llm_segmentation: bool) -> LlmSegmentationOptions:
+def _make_llm_segmentation_options(
+    *,
+    use_llm_segmentation: bool,
+    bypass_llm_segmentation_cache: bool = False,
+) -> LlmSegmentationOptions:
     return LlmSegmentationOptions(
         enabled=use_llm_segmentation,
         model=settings.llm_segmentation_model,
         reasoning_effort=settings.llm_segmentation_reasoning_effort,
+        bypass_cache=bypass_llm_segmentation_cache,
     )
 
 
@@ -332,6 +337,7 @@ class Job(BaseModel):
     raw_srt: Optional[str] = None  # Stage 1: Scribe raw
     aligned_srt: Optional[str] = None  # Deprecated: Qwen alignment is disabled
     refined_srt: Optional[str] = None  # Stage 2: After LLM refinement
+    raw_scribe_response: Optional[Dict[str, Any]] = None
     # Chunk observability
     chunks_completed: int = 0
     total_chunks: int = 0
@@ -342,6 +348,7 @@ class Job(BaseModel):
     audio_duration: Optional[float] = None  # seconds
     use_alignment: bool = False
     use_llm_segmentation: bool = True
+    bypass_llm_segmentation_cache: bool = False
     use_llm_refinement: bool = True
 
 
@@ -616,6 +623,10 @@ async def transcribe(
         True,
         description="Plan Scribe word-to-segment boundaries with LLM",
     ),
+    bypass_llm_segmentation_cache: bool = Form(
+        False,
+        description="Bypass cached LLM segment plans and recompute segmentation",
+    ),
     use_llm_refinement: bool = Form(True, description="Refine Scribe output with LLM"),
     diarize: bool = Form(True, description="Enable Scribe speaker diarization"),
     tag_audio_events: bool = Form(True, description="Tag non-speech audio events"),
@@ -672,6 +683,7 @@ async def transcribe(
         audio_duration=audio_info.duration_seconds,
         use_alignment=False,
         use_llm_segmentation=use_llm_segmentation,
+        bypass_llm_segmentation_cache=bypass_llm_segmentation_cache,
         use_llm_refinement=use_llm_refinement,
     )
     _jobs[job_id] = job
@@ -683,6 +695,7 @@ async def transcribe(
         include_speaker=include_speaker,
         use_alignment=use_alignment,
         use_llm_segmentation=use_llm_segmentation,
+        bypass_llm_segmentation_cache=bypass_llm_segmentation_cache,
         use_llm_refinement=use_llm_refinement,
         diarize=diarize,
         tag_audio_events=tag_audio_events,
@@ -734,6 +747,10 @@ async def transcribe_async(
         True,
         description="Plan Scribe word-to-segment boundaries with LLM",
     ),
+    bypass_llm_segmentation_cache: bool = Form(
+        False,
+        description="Bypass cached LLM segment plans and recompute segmentation",
+    ),
     use_llm_refinement: bool = Form(True, description="Refine Scribe output with LLM"),
     diarize: bool = Form(True, description="Enable Scribe speaker diarization"),
     tag_audio_events: bool = Form(True, description="Tag non-speech audio events"),
@@ -781,6 +798,7 @@ async def transcribe_async(
         audio_duration=audio_info.duration_seconds,
         use_alignment=False,
         use_llm_segmentation=use_llm_segmentation,
+        bypass_llm_segmentation_cache=bypass_llm_segmentation_cache,
         use_llm_refinement=use_llm_refinement,
     )
     _jobs[job_id] = job
@@ -793,6 +811,7 @@ async def transcribe_async(
         include_speaker=include_speaker,
         use_alignment=use_alignment,
         use_llm_segmentation=use_llm_segmentation,
+        bypass_llm_segmentation_cache=bypass_llm_segmentation_cache,
         use_llm_refinement=use_llm_refinement,
         diarize=diarize,
         tag_audio_events=tag_audio_events,
@@ -804,6 +823,105 @@ async def transcribe_async(
     await _job_queue.put(job_id)
 
     # Compute ETA
+    eta = _compute_eta(job_id)
+
+    return TranscribeResponse(
+        job_id=job_id,
+        status=JobStatus.QUEUED,
+        estimated_wait_seconds=eta.get("wait_seconds"),
+        estimated_processing_seconds=eta.get("processing_seconds"),
+        estimated_completion=eta.get("completion"),
+    )
+
+
+@app.post("/transcribe/from-scribe/async", response_model=TranscribeResponse)
+async def transcribe_from_scribe_async(
+    file: UploadFile = File(..., description="Audio or video file"),
+    scribe_response: UploadFile = File(..., description="Raw Scribe V2 JSON response"),
+    context: Optional[str] = Form(None, description="Context for segmentation/refinement only"),
+    language: Optional[str] = Form(None, description="Language hint (ko, en, ja, zh)"),
+    include_speaker: bool = Form(True, description="Include speaker labels"),
+    use_alignment: bool = Form(True, description="Deprecated; ignored"),
+    use_llm_segmentation: bool = Form(
+        True,
+        description="Plan Scribe word-to-segment boundaries with LLM",
+    ),
+    bypass_llm_segmentation_cache: bool = Form(
+        False,
+        description="Bypass cached LLM segment plans and recompute segmentation",
+    ),
+    use_llm_refinement: bool = Form(True, description="Refine Scribe output with LLM"),
+    diarize: bool = Form(True, description="Enable Scribe speaker diarization"),
+    tag_audio_events: bool = Form(True, description="Tag non-speech audio events"),
+    num_speakers: Optional[int] = Form(None, description="Expected speaker count (1-32)"),
+    output_format: Literal["srt", "json"] = Form("srt", description="Output format"),
+    include_logs: bool = Form(False, description="Include refinement logs in result"),
+    include_intermediate: bool = Form(False, description="Include intermediate stage results"),
+):
+    """Run Chalna segmentation/refinement from an already cached raw Scribe response."""
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file provided")
+    if not scribe_response.filename:
+        raise HTTPException(status_code=400, detail="No Scribe response provided")
+    _make_scribe_options(
+        diarize=diarize,
+        tag_audio_events=tag_audio_events,
+        num_speakers=num_speakers,
+    )
+
+    try:
+        raw_payload = json.loads((await scribe_response.read()).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid Scribe response JSON") from exc
+    if not isinstance(raw_payload, dict):
+        raise HTTPException(status_code=400, detail="Scribe response must be a JSON object")
+
+    suffix = Path(file.filename).suffix
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        content = await file.read()
+        tmp.write(content)
+        tmp_path = Path(tmp.name)
+
+    try:
+        audio_info = validate_audio_file(tmp_path)
+    except ChalnaError:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+    job_id = str(uuid.uuid4())
+    job = Job(
+        job_id=job_id,
+        status=JobStatus.QUEUED,
+        created_at=datetime.utcnow(),
+        output_format=output_format,
+        audio_duration=audio_info.duration_seconds,
+        use_alignment=False,
+        use_llm_segmentation=use_llm_segmentation,
+        bypass_llm_segmentation_cache=bypass_llm_segmentation_cache,
+        use_llm_refinement=use_llm_refinement,
+        raw_scribe_response=raw_payload,
+    )
+    _jobs[job_id] = job
+
+    _job_params[job_id] = dict(
+        audio_path=tmp_path,
+        context=context,
+        language=language,
+        include_speaker=include_speaker,
+        use_alignment=use_alignment,
+        use_llm_segmentation=use_llm_segmentation,
+        bypass_llm_segmentation_cache=bypass_llm_segmentation_cache,
+        use_llm_refinement=use_llm_refinement,
+        diarize=diarize,
+        tag_audio_events=tag_audio_events,
+        num_speakers=num_speakers,
+        output_format=output_format,
+        include_logs=include_logs,
+        include_intermediate=include_intermediate,
+        scribe_response_override=raw_payload,
+    )
+    await _job_queue.put(job_id)
+
     eta = _compute_eta(job_id)
 
     return TranscribeResponse(
@@ -1007,6 +1125,7 @@ async def _process_job(
     include_speaker: bool,
     use_alignment: bool,
     use_llm_segmentation: bool,
+    bypass_llm_segmentation_cache: bool,
     use_llm_refinement: bool,
     diarize: bool,
     tag_audio_events: bool,
@@ -1014,6 +1133,7 @@ async def _process_job(
     output_format: str,
     include_logs: bool = False,
     include_intermediate: bool = False,
+    scribe_response_override: Optional[dict] = None,
 ):
     """Process transcription job in background."""
     job = _jobs[job_id]
@@ -1075,21 +1195,38 @@ async def _process_job(
         )
         llm_segmentation_options = _make_llm_segmentation_options(
             use_llm_segmentation=use_llm_segmentation,
+            bypass_llm_segmentation_cache=bypass_llm_segmentation_cache,
         )
 
         # Run transcription (in thread pool to not block)
         loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None,
-            lambda: pipeline.transcribe(
-                audio_path=audio_path,
-                context=context,
-                language=language,
-                progress_callback=progress_callback,
-                scribe_options=scribe_options,
-                llm_segmentation_options=llm_segmentation_options,
+        if scribe_response_override is not None:
+            job.raw_scribe_response = scribe_response_override
+            result = await loop.run_in_executor(
+                None,
+                lambda: pipeline.transcribe_from_scribe_response(
+                    audio_path=audio_path,
+                    scribe_response=scribe_response_override,
+                    context=context,
+                    language=language,
+                    progress_callback=progress_callback,
+                    scribe_options=scribe_options,
+                    llm_segmentation_options=llm_segmentation_options,
+                )
             )
-        )
+        else:
+            result = await loop.run_in_executor(
+                None,
+                lambda: pipeline.transcribe(
+                    audio_path=audio_path,
+                    context=context,
+                    language=language,
+                    progress_callback=progress_callback,
+                    scribe_options=scribe_options,
+                    llm_segmentation_options=llm_segmentation_options,
+                )
+            )
+            job.raw_scribe_response = pipeline._last_scribe_response
 
         job.progress = 0.95
 
@@ -1130,6 +1267,7 @@ async def _process_job(
             if include_intermediate:
                 result_data["raw_srt"] = job.raw_srt
                 result_data["refined_srt"] = job.refined_srt
+                result_data["scribe_response"] = job.raw_scribe_response
             import json
             job.result = json.dumps(result_data, ensure_ascii=False, indent=2)
         else:

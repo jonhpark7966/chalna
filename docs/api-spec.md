@@ -78,6 +78,7 @@ Multipart form parameters:
 | `tag_audio_events` | bool | true | No | Include Scribe audio event tags |
 | `num_speakers` | int | null | No | Expected speaker count, 1-32 |
 | `use_llm_segmentation` | bool | true | No | Plan Scribe word-to-segment boundaries with LLM |
+| `bypass_llm_segmentation_cache` | bool | false | No | Recompute LLM segmentation without reading the segment plan cache |
 | `use_llm_refinement` | bool | true | No | Refine Scribe output with LLM |
 | `use_alignment` | bool | ignored | No | Deprecated; ignored |
 | `output_format` | string | `srt` | No | `srt` or `json` |

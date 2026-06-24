@@ -152,6 +152,23 @@ def _validate_segmentation_boundary_rule(value: str) -> str:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
 
+async def _read_overlap_intervals_upload(
+    overlap_intervals: Optional[UploadFile],
+) -> dict[str, Any] | list[Any] | None:
+    if overlap_intervals is None or not overlap_intervals.filename:
+        return None
+    try:
+        payload = json.loads((await overlap_intervals.read()).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid overlap intervals JSON") from exc
+    if not isinstance(payload, (dict, list)):
+        raise HTTPException(
+            status_code=400,
+            detail="Overlap intervals JSON must be an object or list",
+        )
+    return payload
+
+
 def get_pipeline():
     """Get or create pipeline instance."""
     global _pipeline
@@ -652,6 +669,10 @@ async def transcribe(
     output_format: Literal["srt", "json"] = Form("srt", description="Output format"),
     include_logs: bool = Form(False, description="Include refinement logs in JSON output"),
     include_intermediate: bool = Form(False, description="Include intermediate stage results"),
+    overlap_intervals: Optional[UploadFile] = File(
+        None,
+        description="Optional overlap protection intervals JSON",
+    ),
 ):
     """
     Transcribe audio/video file to subtitles (synchronous).
@@ -679,6 +700,7 @@ async def transcribe(
     segmentation_boundary_rule = _validate_segmentation_boundary_rule(
         segmentation_boundary_rule
     )
+    overlap_protection = await _read_overlap_intervals_upload(overlap_intervals)
 
     # Save uploaded file
     suffix = Path(file.filename).suffix
@@ -725,6 +747,7 @@ async def transcribe(
         output_format=output_format,
         include_logs=include_logs,
         include_intermediate=include_intermediate,
+        overlap_protection=overlap_protection,
     )
 
     event = asyncio.Event()
@@ -784,6 +807,10 @@ async def transcribe_async(
     output_format: Literal["srt", "json"] = Form("srt", description="Output format"),
     include_logs: bool = Form(False, description="Include refinement logs in result"),
     include_intermediate: bool = Form(False, description="Include intermediate stage results"),
+    overlap_intervals: Optional[UploadFile] = File(
+        None,
+        description="Optional overlap protection intervals JSON",
+    ),
 ):
     """
     Transcribe audio/video file asynchronously (for long files).
@@ -801,6 +828,7 @@ async def transcribe_async(
     segmentation_boundary_rule = _validate_segmentation_boundary_rule(
         segmentation_boundary_rule
     )
+    overlap_protection = await _read_overlap_intervals_upload(overlap_intervals)
 
     # Save uploaded file
     suffix = Path(file.filename).suffix
@@ -849,6 +877,7 @@ async def transcribe_async(
         output_format=output_format,
         include_logs=include_logs,
         include_intermediate=include_intermediate,
+        overlap_protection=overlap_protection,
     )
     await _job_queue.put(job_id)
 
@@ -891,6 +920,10 @@ async def transcribe_from_scribe_async(
     output_format: Literal["srt", "json"] = Form("srt", description="Output format"),
     include_logs: bool = Form(False, description="Include refinement logs in result"),
     include_intermediate: bool = Form(False, description="Include intermediate stage results"),
+    overlap_intervals: Optional[UploadFile] = File(
+        None,
+        description="Optional overlap protection intervals JSON",
+    ),
 ):
     """Run Chalna segmentation/refinement from an already cached raw Scribe response."""
     if not file.filename:
@@ -905,6 +938,7 @@ async def transcribe_from_scribe_async(
     segmentation_boundary_rule = _validate_segmentation_boundary_rule(
         segmentation_boundary_rule
     )
+    overlap_protection = await _read_overlap_intervals_upload(overlap_intervals)
 
     try:
         raw_payload = json.loads((await scribe_response.read()).decode("utf-8"))
@@ -957,6 +991,7 @@ async def transcribe_from_scribe_async(
         include_logs=include_logs,
         include_intermediate=include_intermediate,
         scribe_response_override=raw_payload,
+        overlap_protection=overlap_protection,
     )
     await _job_queue.put(job_id)
 
@@ -1173,6 +1208,7 @@ async def _process_job(
     include_logs: bool = False,
     include_intermediate: bool = False,
     scribe_response_override: Optional[dict] = None,
+    overlap_protection: Optional[dict[str, Any] | list[Any]] = None,
 ):
     """Process transcription job in background."""
     job = _jobs[job_id]
@@ -1252,6 +1288,7 @@ async def _process_job(
                     progress_callback=progress_callback,
                     scribe_options=scribe_options,
                     llm_segmentation_options=llm_segmentation_options,
+                    overlap_protection=overlap_protection,
                 )
             )
         else:
@@ -1264,6 +1301,7 @@ async def _process_job(
                     progress_callback=progress_callback,
                     scribe_options=scribe_options,
                     llm_segmentation_options=llm_segmentation_options,
+                    overlap_protection=overlap_protection,
                 )
             )
             job.raw_scribe_response = pipeline._last_scribe_response

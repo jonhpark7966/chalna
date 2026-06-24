@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from chalna.exceptions import (
     CodexAPIError,
@@ -18,6 +18,7 @@ from chalna.models import (
     TranscriptionMetadata,
     TranscriptionResult,
 )
+from chalna.overlap_protection import protect_overlapped_segments
 from chalna.scribe_adapter import scribe_response_to_segments
 from chalna.scribe_cache import (
     ScribeResponseCache,
@@ -100,6 +101,7 @@ class ChalnaPipeline:
         progress_callback: Optional[Callable[[str, float], None]] = None,
         scribe_options: Optional[ScribeOptions] = None,
         llm_segmentation_options: Optional[LlmSegmentationOptions] = None,
+        overlap_protection: Optional[dict[str, Any] | list[Any]] = None,
     ) -> TranscriptionResult:
         """Transcribe an audio/video file to Chalna segments and subtitles."""
         del max_new_tokens  # Kept for compatibility with the previous local ASR API.
@@ -191,6 +193,14 @@ class ChalnaPipeline:
         segments = self._fix_overlapping_timestamps(segments, verbose=verbose)
         for i, segment in enumerate(segments, start=1):
             segment.index = i
+        segments, overlap_protection_summary = protect_overlapped_segments(
+            segments,
+            overlap_protection,
+        )
+        if overlap_protection_summary is not None:
+            segments = self._fix_overlapping_timestamps(segments, verbose=verbose)
+            for i, segment in enumerate(segments, start=1):
+                segment.index = i
 
         speakers = sorted({s.speaker_id for s in segments if s.speaker_id})
         result_language = language_code or language
@@ -207,6 +217,7 @@ class ChalnaPipeline:
             segmentation_boundary_rule=boundary_result.rule,
             segmentation_boundary_effective_rule=boundary_result.effective_rule,
             segmentation_boundary_stats=boundary_result.stats,
+            overlap_protection=overlap_protection_summary,
         )
 
         intermediate = IntermediateResults(
@@ -236,6 +247,7 @@ class ChalnaPipeline:
         progress_callback: Optional[Callable[[str, float], None]] = None,
         scribe_options: Optional[ScribeOptions] = None,
         llm_segmentation_options: Optional[LlmSegmentationOptions] = None,
+        overlap_protection: Optional[dict[str, Any] | list[Any]] = None,
     ) -> TranscriptionResult:
         """Run Chalna segmentation/refinement from a pre-existing raw Scribe response."""
         del max_new_tokens
@@ -319,6 +331,14 @@ class ChalnaPipeline:
         segments = self._fix_overlapping_timestamps(segments, verbose=verbose)
         for i, segment in enumerate(segments, start=1):
             segment.index = i
+        segments, overlap_protection_summary = protect_overlapped_segments(
+            segments,
+            overlap_protection,
+        )
+        if overlap_protection_summary is not None:
+            segments = self._fix_overlapping_timestamps(segments, verbose=verbose)
+            for i, segment in enumerate(segments, start=1):
+                segment.index = i
 
         speakers = sorted({s.speaker_id for s in segments if s.speaker_id})
         result_language = language_code or language
@@ -335,6 +355,7 @@ class ChalnaPipeline:
             segmentation_boundary_rule=boundary_result.rule,
             segmentation_boundary_effective_rule=boundary_result.effective_rule,
             segmentation_boundary_stats=boundary_result.stats,
+            overlap_protection=overlap_protection_summary,
         )
 
         intermediate = IntermediateResults(

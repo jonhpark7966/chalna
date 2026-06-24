@@ -68,13 +68,14 @@ class Segment:
     text: str
     speaker_id: Optional[str] = None
     confidence: float = 1.0
+    overlap_protection: Optional[dict[str, Any]] = None
 
     @property
     def duration(self) -> float:
         return self.end_time - self.start_time
 
     def to_dict(self) -> dict:
-        return {
+        result = {
             "index": self.index,
             "start_time": self.start_time,
             "end_time": self.end_time,
@@ -82,6 +83,9 @@ class Segment:
             "speaker_id": self.speaker_id,
             "confidence": self.confidence,
         }
+        if self.overlap_protection is not None:
+            result["overlap_protection"] = self.overlap_protection
+        return result
 
 
 @dataclass
@@ -99,6 +103,7 @@ class TranscriptionMetadata:
     segmentation_boundary_rule: Optional[str] = None
     segmentation_boundary_effective_rule: Optional[str] = None
     segmentation_boundary_stats: Optional[dict[str, Any]] = None
+    overlap_protection: Optional[dict[str, Any]] = None
 
     def to_dict(self) -> dict:
         result = {
@@ -121,6 +126,8 @@ class TranscriptionMetadata:
             )
         if self.segmentation_boundary_stats is not None:
             result["segmentation_boundary_stats"] = self.segmentation_boundary_stats
+        if self.overlap_protection is not None:
+            result["overlap_protection"] = self.overlap_protection
         return result
 
 

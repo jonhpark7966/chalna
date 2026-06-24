@@ -291,6 +291,7 @@ def _is_recoverable_full_call_error(exc: Exception) -> bool:
 
 
 _BOUNDARY_PUNCTUATION = tuple(".?!,;:。？！…，、；：")
+_SENTENCE_ENDING_PUNCTUATION = tuple(".?!。？！…")
 _TRAILING_PUNCTUATION = "\"'”’)]}.,?!;:。？！…，、；："
 _CONTINUATION_START_WORDS = {
     "수",
@@ -331,6 +332,11 @@ def _token_without_trailing_punctuation(text: Any) -> str:
 def _ends_with_boundary_punctuation(text: Any) -> bool:
     token = _boundary_token(text).rstrip("\"'”’)]}")
     return bool(token) and token.endswith(_BOUNDARY_PUNCTUATION)
+
+
+def _ends_with_sentence_ending_punctuation(text: Any) -> bool:
+    token = _boundary_token(text).rstrip("\"'”’)]}")
+    return bool(token) and token.endswith(_SENTENCE_ENDING_PUNCTUATION)
 
 
 def _is_poor_legacy_chunk_boundary(
@@ -448,6 +454,31 @@ def _split_range_on_speaker_changes(
     return splits
 
 
+def _split_range_on_sentence_endings(
+    speech_words: list[dict[str, Any]],
+    *,
+    start: int,
+    end: int,
+) -> list[dict[str, int]]:
+    splits: list[dict[str, int]] = []
+    current_start = start
+
+    for index in range(start, end):
+        if not _ends_with_sentence_ending_punctuation(speech_words[index].get("text")):
+            continue
+        splits.append({
+            "start_word_index": current_start,
+            "end_word_index": index,
+        })
+        current_start = index + 1
+
+    splits.append({
+        "start_word_index": current_start,
+        "end_word_index": end,
+    })
+    return splits
+
+
 def _validate_ranges(
     items: list[Any],
     *,
@@ -493,7 +524,22 @@ def _validate_ranges(
                 "replacements": split_ranges,
             })
 
-        ranges.extend(split_ranges)
+        repaired_ranges: list[dict[str, int]] = []
+        for split_range in split_ranges:
+            sentence_ranges = _split_range_on_sentence_endings(
+                speech_words,
+                start=split_range["start_word_index"],
+                end=split_range["end_word_index"],
+            )
+            if len(sentence_ranges) > 1 and repair_log is not None:
+                repair_log.append({
+                    "reason": "sentence_ending_punctuation",
+                    "original": split_range,
+                    "replacements": sentence_ranges,
+                })
+            repaired_ranges.extend(sentence_ranges)
+
+        ranges.extend(repaired_ranges)
         next_index = end + 1
 
     if next_index != expected_end + 1:
@@ -585,6 +631,7 @@ class LlmScribeSegmenter:
             max_segment_duration=segmentation_options.max_segment_duration,
             max_words_per_call=segmentation_options.max_words_per_call,
             bypass_cache=segmentation_options.bypass_cache,
+            boundary_rule=segmentation_options.boundary_rule,
         )
         metadata = build_segment_cache_metadata(
             scribe_cache_key=scribe_cache_key,
@@ -1023,10 +1070,12 @@ Clause-level edit decisions:
   split each formulation unless they are only a few words.
 - Keep short closing inference or evaluation phrases as their own segment when
   they summarize or hedge the previous explanation.
-- Punctuation is a mandatory boundary. If a word token ends with punctuation that
-  closes or separates a clause/sentence, end the current segment at that word and
-  start a new segment at the next word. Do not merge across punctuation,
-  even when the meaning or topic continues.
+- Sentence-ending punctuation is a mandatory boundary. If a word token ends with
+  punctuation that closes a sentence, end the current segment at that word and
+  start a new segment at the next word. Do not merge across sentence-ending
+  punctuation, even when the meaning or topic continues.
+- Commas, semicolons, colons, and phrase-separating punctuation are preferred
+  boundary candidates, but they are not mandatory boundaries.
 - Prefer splitting at punctuation or natural pause boundaries, but split at clause
   boundaries even when punctuation is missing.
 - If the same sentence contains a condition, a qualification, and a conclusion,

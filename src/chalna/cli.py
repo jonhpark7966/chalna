@@ -82,6 +82,11 @@ def transcribe(
         "--llm-segmentation/--no-llm-segmentation",
         help="Use LLM to plan Scribe word-to-subtitle segment boundaries",
     ),
+    segmentation_boundary_rule: str = typer.Option(
+        "word_boundary",
+        "--segmentation-boundary-rule",
+        help="Timestamp boundary rule: word_boundary, midpoint_gap, low_energy_gap_v1",
+    ),
     diarize: bool = typer.Option(
         True,
         "--diarize/--no-diarize",
@@ -172,7 +177,10 @@ def transcribe(
                     tag_audio_events=tag_audio_events,
                     num_speakers=num_speakers,
                 ),
-                llm_segmentation_options=LlmSegmentationOptions(enabled=llm_segmentation),
+                llm_segmentation_options=LlmSegmentationOptions(
+                    enabled=llm_segmentation,
+                    boundary_rule=segmentation_boundary_rule,
+                ),
             )
 
             progress.update(task, description="Writing output...")

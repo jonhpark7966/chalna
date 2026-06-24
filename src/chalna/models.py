@@ -5,7 +5,7 @@ Data models for Chalna.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Any, List, Optional
 
 
 @dataclass
@@ -38,6 +38,7 @@ class LlmSegmentationOptions:
     max_segment_duration: float = 5.0
     max_words_per_call: int = 180
     bypass_cache: bool = False
+    boundary_rule: str = "word_boundary"
 
     def __post_init__(self) -> None:
         if self.max_segment_duration <= 0:
@@ -53,6 +54,7 @@ class LlmSegmentationOptions:
             "max_segment_duration": self.max_segment_duration,
             "max_words_per_call": self.max_words_per_call,
             "bypass_cache": self.bypass_cache,
+            "boundary_rule": self.boundary_rule,
         }
 
 
@@ -94,6 +96,9 @@ class TranscriptionMetadata:
     refined: bool = True  # whether LLM refinement was applied
     timestamp_source: Optional[str] = None
     segmentation_source: Optional[str] = None
+    segmentation_boundary_rule: Optional[str] = None
+    segmentation_boundary_effective_rule: Optional[str] = None
+    segmentation_boundary_stats: Optional[dict[str, Any]] = None
 
     def to_dict(self) -> dict:
         result = {
@@ -108,6 +113,14 @@ class TranscriptionMetadata:
             result["timestamp_source"] = self.timestamp_source
         if self.segmentation_source is not None:
             result["segmentation_source"] = self.segmentation_source
+        if self.segmentation_boundary_rule is not None:
+            result["segmentation_boundary_rule"] = self.segmentation_boundary_rule
+        if self.segmentation_boundary_effective_rule is not None:
+            result["segmentation_boundary_effective_rule"] = (
+                self.segmentation_boundary_effective_rule
+            )
+        if self.segmentation_boundary_stats is not None:
+            result["segmentation_boundary_stats"] = self.segmentation_boundary_stats
         return result
 
 

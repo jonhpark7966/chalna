@@ -27,6 +27,7 @@ from chalna.scribe_cache import (
 from chalna.scribe_client import ScribeClient
 from chalna.scribe_llm_segmenter import LlmScribeSegmenter
 from chalna.segment_cache import SegmentPlanCache
+from chalna.segmentation_boundary import apply_boundary_rule
 from chalna.settings import settings
 from chalna.validation import (
     check_disk_space,
@@ -73,6 +74,7 @@ class ChalnaPipeline:
         self._refined_segments: Optional[list[Segment]] = None
         self._refinement_log: Optional[list[dict]] = None
         self._segmentation_log: Optional[list[dict]] = None
+        self._segmentation_boundary_stats: Optional[dict] = None
         self._scribe_words_by_segment_index: dict[int, list[dict]] = {}
         self._last_scribe_response: Optional[dict] = None
 
@@ -154,6 +156,13 @@ class ChalnaPipeline:
                 segmentation_options=segmentation_options,
             )
         )
+        boundary_result = apply_boundary_rule(
+            segments,
+            rule=segmentation_options.boundary_rule,
+            audio_path=audio_path,
+        )
+        segments = boundary_result.segments
+        self._segmentation_boundary_stats = boundary_result.stats
         self._scribe_words_by_segment_index = words_by_segment_index
 
         if not segments:
@@ -195,6 +204,9 @@ class ChalnaPipeline:
             refined=self.use_llm_refinement and self._refined_segments is not None,
             timestamp_source=self.scribe_client.model_id,
             segmentation_source=segmentation_source,
+            segmentation_boundary_rule=boundary_result.rule,
+            segmentation_boundary_effective_rule=boundary_result.effective_rule,
+            segmentation_boundary_stats=boundary_result.stats,
         )
 
         intermediate = IntermediateResults(
@@ -272,6 +284,13 @@ class ChalnaPipeline:
                 segmentation_options=segmentation_options,
             )
         )
+        boundary_result = apply_boundary_rule(
+            segments,
+            rule=segmentation_options.boundary_rule,
+            audio_path=audio_path,
+        )
+        segments = boundary_result.segments
+        self._segmentation_boundary_stats = boundary_result.stats
         self._scribe_words_by_segment_index = words_by_segment_index
 
         if not segments:
@@ -313,6 +332,9 @@ class ChalnaPipeline:
             refined=self.use_llm_refinement and self._refined_segments is not None,
             timestamp_source=self.scribe_client.model_id,
             segmentation_source=segmentation_source,
+            segmentation_boundary_rule=boundary_result.rule,
+            segmentation_boundary_effective_rule=boundary_result.effective_rule,
+            segmentation_boundary_stats=boundary_result.stats,
         )
 
         intermediate = IntermediateResults(
@@ -375,6 +397,7 @@ class ChalnaPipeline:
         self._refined_segments = None
         self._refinement_log = None
         self._segmentation_log = None
+        self._segmentation_boundary_stats = None
         self._last_alignment_log = []
         self._pre_alignment_segments = None
         self._scribe_words_by_segment_index = {}

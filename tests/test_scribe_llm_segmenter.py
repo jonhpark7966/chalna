@@ -2,7 +2,7 @@ import json
 
 from chalna.models import LlmSegmentationOptions, ScribeOptions
 from chalna.scribe_llm_segmenter import LlmScribeSegmenter
-from chalna.segment_cache import SegmentPlanCache
+from chalna.segment_cache import SegmentPlanCache, build_segment_cache_metadata
 
 SCRIBE_RESPONSE = {
     "language_code": "ko",
@@ -94,8 +94,9 @@ def test_llm_segmenter_uses_word_ranges_and_caches_plan(tmp_path, monkeypatch):
     assert "index|text|speaker_id|next_gap" in prompt
     assert "0|안녕하세요|A|0.100" in prompt
     assert "3|문장입니다.|A|-" in prompt
-    assert "Punctuation is a mandatory boundary" in prompt
-    assert "Do not merge across punctuation" in prompt
+    assert "Sentence-ending punctuation is a mandatory boundary" in prompt
+    assert "Do not merge across sentence-ending" in prompt
+    assert "Commas, semicolons, colons" in prompt
     assert '"start":' not in prompt
     assert calls[0]["model"] == "gpt-5.5"
     assert calls[0]["reasoning_effort"] == "xhigh"
@@ -206,6 +207,165 @@ def test_llm_segmenter_repairs_mixed_speaker_compact_ranges(tmp_path, monkeypatc
     ]
 
 
+def test_llm_segmenter_hard_splits_sentence_endings(tmp_path, monkeypatch):
+    response = _scribe_response_from_words([
+        ("첫", "A"),
+        ("문장입니다.", "A"),
+        ("다음", "A"),
+        ("질문인가요?", "A"),
+        ("마지막", "A"),
+    ])
+
+    monkeypatch.setattr(
+        "chalna.scribe_llm_segmenter.call_codex_cli",
+        lambda *args, **kwargs: json.dumps([{"start_word_index": 0, "end_word_index": 4}]),
+    )
+    segmenter = LlmScribeSegmenter(cache=SegmentPlanCache(tmp_path / "segment_cache"))
+
+    result = segmenter.segment(
+        response,
+        scribe_cache_key="scribe-key",
+        language_code="ko",
+        context=None,
+        scribe_options=ScribeOptions(),
+        segmentation_options=LlmSegmentationOptions(max_words_per_call=20),
+        include_audio_events=False,
+    )
+
+    assert [segment.text for segment in result.segments] == [
+        "첫 문장입니다.",
+        "다음 질문인가요?",
+        "마지막",
+    ]
+    assert result.log[0]["range_repair_count"] == 1
+    assert result.log[1]["output"]["range_repairs"] == [
+        {
+            "reason": "sentence_ending_punctuation",
+            "original": {"start_word_index": 0, "end_word_index": 4},
+            "replacements": [
+                {"start_word_index": 0, "end_word_index": 1},
+                {"start_word_index": 2, "end_word_index": 3},
+                {"start_word_index": 4, "end_word_index": 4},
+            ],
+        }
+    ]
+
+
+def test_llm_segmenter_does_not_hard_split_commas(tmp_path, monkeypatch):
+    response = _scribe_response_from_words([
+        ("네,", "A"),
+        ("좋습니다.", "A"),
+    ])
+
+    monkeypatch.setattr(
+        "chalna.scribe_llm_segmenter.call_codex_cli",
+        lambda *args, **kwargs: json.dumps([{"start_word_index": 0, "end_word_index": 1}]),
+    )
+    segmenter = LlmScribeSegmenter(cache=SegmentPlanCache(tmp_path / "segment_cache"))
+
+    result = segmenter.segment(
+        response,
+        scribe_cache_key="scribe-key",
+        language_code="ko",
+        context=None,
+        scribe_options=ScribeOptions(),
+        segmentation_options=LlmSegmentationOptions(max_words_per_call=20),
+        include_audio_events=False,
+    )
+
+    assert [segment.text for segment in result.segments] == ["네, 좋습니다."]
+    assert result.log[0]["range_repair_count"] == 0
+    assert "range_repairs" not in result.log[1]["output"]
+
+
+def test_llm_segmenter_repairs_speaker_and_sentence_boundaries(tmp_path, monkeypatch):
+    response = _scribe_response_from_words([
+        ("첫", "A"),
+        ("문장입니다.", "A"),
+        ("응.", "B"),
+        ("다음", "B"),
+        ("말입니다.", "B"),
+    ])
+
+    monkeypatch.setattr(
+        "chalna.scribe_llm_segmenter.call_codex_cli",
+        lambda *args, **kwargs: json.dumps([{"start_word_index": 0, "end_word_index": 4}]),
+    )
+    segmenter = LlmScribeSegmenter(cache=SegmentPlanCache(tmp_path / "segment_cache"))
+
+    result = segmenter.segment(
+        response,
+        scribe_cache_key="scribe-key",
+        language_code="ko",
+        context=None,
+        scribe_options=ScribeOptions(),
+        segmentation_options=LlmSegmentationOptions(max_words_per_call=20),
+        include_audio_events=False,
+    )
+
+    assert [segment.text for segment in result.segments] == [
+        "첫 문장입니다.",
+        "응.",
+        "다음 말입니다.",
+    ]
+    assert result.log[0]["range_repair_count"] == 2
+    assert result.log[1]["output"]["range_repairs"] == [
+        {
+            "reason": "mixed_speaker_range",
+            "original": {"start_word_index": 0, "end_word_index": 4},
+            "replacements": [
+                {"start_word_index": 0, "end_word_index": 1},
+                {"start_word_index": 2, "end_word_index": 4},
+            ],
+        },
+        {
+            "reason": "sentence_ending_punctuation",
+            "original": {"start_word_index": 2, "end_word_index": 4},
+            "replacements": [
+                {"start_word_index": 2, "end_word_index": 2},
+                {"start_word_index": 3, "end_word_index": 4},
+            ],
+        },
+    ]
+
+
+def test_llm_segmenter_applies_sentence_split_to_cached_broad_ranges(tmp_path, monkeypatch):
+    cache = SegmentPlanCache(tmp_path / "segment_cache")
+    scribe_options = ScribeOptions()
+    segmentation_options = LlmSegmentationOptions(max_words_per_call=20)
+    metadata = build_segment_cache_metadata(
+        scribe_cache_key="scribe-key",
+        language_code="ko",
+        scribe_options=scribe_options,
+        segmentation_options=segmentation_options,
+    )
+    cache.put(metadata, {
+        "ranges": [{"start_word_index": 0, "end_word_index": 3}],
+        "log": [{"status": "planned", "mode": "compact_full_words"}],
+    })
+    monkeypatch.setattr(
+        "chalna.scribe_llm_segmenter.call_codex_cli",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("cache should be used")),
+    )
+    segmenter = LlmScribeSegmenter(cache=cache)
+
+    result = segmenter.segment(
+        SCRIBE_RESPONSE,
+        scribe_cache_key="scribe-key",
+        language_code="ko",
+        context=None,
+        scribe_options=scribe_options,
+        segmentation_options=segmentation_options,
+        include_audio_events=False,
+    )
+
+    assert result.cache_hit is True
+    assert [segment.text for segment in result.segments] == [
+        "안녕하세요 반갑습니다.",
+        "다음 문장입니다.",
+    ]
+
+
 def test_llm_segmenter_escapes_compact_table_cells(tmp_path, monkeypatch):
     calls = []
     response = {
@@ -274,7 +434,8 @@ def test_llm_segmenter_falls_back_to_legacy_json_chunks(tmp_path, monkeypatch):
     assert result.log[1]["status"] == "fallback_to_legacy_chunks"
     assert result.log[2]["mode"] == "legacy_json_word_chunks"
     assert [segment.text for segment in result.segments] == [
-        "안녕하세요 반갑습니다. 다음 문장입니다.",
+        "안녕하세요 반갑습니다.",
+        "다음 문장입니다.",
         "[laughter]",
     ]
 

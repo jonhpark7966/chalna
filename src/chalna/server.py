@@ -29,6 +29,7 @@ from chalna.db import save_job as db_save_job
 from chalna.exceptions import ChalnaError
 from chalna.models import LlmSegmentationOptions, ScribeOptions
 from chalna.monitoring import capture_job_exception, init_sentry
+from chalna.segmentation_boundary import DEFAULT_BOUNDARY_RULE, normalize_boundary_rule
 from chalna.settings import settings
 from chalna.validation import validate_audio_file
 
@@ -133,13 +134,22 @@ def _make_llm_segmentation_options(
     *,
     use_llm_segmentation: bool,
     bypass_llm_segmentation_cache: bool = False,
+    segmentation_boundary_rule: str = DEFAULT_BOUNDARY_RULE,
 ) -> LlmSegmentationOptions:
     return LlmSegmentationOptions(
         enabled=use_llm_segmentation,
         model=settings.llm_segmentation_model,
         reasoning_effort=settings.llm_segmentation_reasoning_effort,
         bypass_cache=bypass_llm_segmentation_cache,
+        boundary_rule=normalize_boundary_rule(segmentation_boundary_rule),
     )
+
+
+def _validate_segmentation_boundary_rule(value: str) -> str:
+    try:
+        return normalize_boundary_rule(value)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 def get_pipeline():
@@ -433,6 +443,10 @@ class MetadataModel(BaseModel):
     aligned: bool = False
     refined: bool = True
     timestamp_source: Optional[str] = None
+    segmentation_source: Optional[str] = None
+    segmentation_boundary_rule: Optional[str] = None
+    segmentation_boundary_effective_rule: Optional[str] = None
+    segmentation_boundary_stats: Optional[dict[str, Any]] = None
 
 
 class TranscriptionResultModel(BaseModel):
@@ -628,6 +642,10 @@ async def transcribe(
         description="Bypass cached LLM segment plans and recompute segmentation",
     ),
     use_llm_refinement: bool = Form(True, description="Refine Scribe output with LLM"),
+    segmentation_boundary_rule: str = Form(
+        DEFAULT_BOUNDARY_RULE,
+        description="Post-segmentation timestamp boundary rule",
+    ),
     diarize: bool = Form(True, description="Enable Scribe speaker diarization"),
     tag_audio_events: bool = Form(True, description="Tag non-speech audio events"),
     num_speakers: Optional[int] = Form(None, description="Expected speaker count (1-32)"),
@@ -657,6 +675,9 @@ async def transcribe(
         diarize=diarize,
         tag_audio_events=tag_audio_events,
         num_speakers=num_speakers,
+    )
+    segmentation_boundary_rule = _validate_segmentation_boundary_rule(
+        segmentation_boundary_rule
     )
 
     # Save uploaded file
@@ -697,6 +718,7 @@ async def transcribe(
         use_llm_segmentation=use_llm_segmentation,
         bypass_llm_segmentation_cache=bypass_llm_segmentation_cache,
         use_llm_refinement=use_llm_refinement,
+        segmentation_boundary_rule=segmentation_boundary_rule,
         diarize=diarize,
         tag_audio_events=tag_audio_events,
         num_speakers=num_speakers,
@@ -752,6 +774,10 @@ async def transcribe_async(
         description="Bypass cached LLM segment plans and recompute segmentation",
     ),
     use_llm_refinement: bool = Form(True, description="Refine Scribe output with LLM"),
+    segmentation_boundary_rule: str = Form(
+        DEFAULT_BOUNDARY_RULE,
+        description="Post-segmentation timestamp boundary rule",
+    ),
     diarize: bool = Form(True, description="Enable Scribe speaker diarization"),
     tag_audio_events: bool = Form(True, description="Tag non-speech audio events"),
     num_speakers: Optional[int] = Form(None, description="Expected speaker count (1-32)"),
@@ -771,6 +797,9 @@ async def transcribe_async(
         diarize=diarize,
         tag_audio_events=tag_audio_events,
         num_speakers=num_speakers,
+    )
+    segmentation_boundary_rule = _validate_segmentation_boundary_rule(
+        segmentation_boundary_rule
     )
 
     # Save uploaded file
@@ -813,6 +842,7 @@ async def transcribe_async(
         use_llm_segmentation=use_llm_segmentation,
         bypass_llm_segmentation_cache=bypass_llm_segmentation_cache,
         use_llm_refinement=use_llm_refinement,
+        segmentation_boundary_rule=segmentation_boundary_rule,
         diarize=diarize,
         tag_audio_events=tag_audio_events,
         num_speakers=num_speakers,
@@ -851,6 +881,10 @@ async def transcribe_from_scribe_async(
         description="Bypass cached LLM segment plans and recompute segmentation",
     ),
     use_llm_refinement: bool = Form(True, description="Refine Scribe output with LLM"),
+    segmentation_boundary_rule: str = Form(
+        DEFAULT_BOUNDARY_RULE,
+        description="Post-segmentation timestamp boundary rule",
+    ),
     diarize: bool = Form(True, description="Enable Scribe speaker diarization"),
     tag_audio_events: bool = Form(True, description="Tag non-speech audio events"),
     num_speakers: Optional[int] = Form(None, description="Expected speaker count (1-32)"),
@@ -867,6 +901,9 @@ async def transcribe_from_scribe_async(
         diarize=diarize,
         tag_audio_events=tag_audio_events,
         num_speakers=num_speakers,
+    )
+    segmentation_boundary_rule = _validate_segmentation_boundary_rule(
+        segmentation_boundary_rule
     )
 
     try:
@@ -912,6 +949,7 @@ async def transcribe_from_scribe_async(
         use_llm_segmentation=use_llm_segmentation,
         bypass_llm_segmentation_cache=bypass_llm_segmentation_cache,
         use_llm_refinement=use_llm_refinement,
+        segmentation_boundary_rule=segmentation_boundary_rule,
         diarize=diarize,
         tag_audio_events=tag_audio_events,
         num_speakers=num_speakers,
@@ -1127,6 +1165,7 @@ async def _process_job(
     use_llm_segmentation: bool,
     bypass_llm_segmentation_cache: bool,
     use_llm_refinement: bool,
+    segmentation_boundary_rule: str,
     diarize: bool,
     tag_audio_events: bool,
     num_speakers: Optional[int],
@@ -1196,6 +1235,7 @@ async def _process_job(
         llm_segmentation_options = _make_llm_segmentation_options(
             use_llm_segmentation=use_llm_segmentation,
             bypass_llm_segmentation_cache=bypass_llm_segmentation_cache,
+            segmentation_boundary_rule=segmentation_boundary_rule,
         )
 
         # Run transcription (in thread pool to not block)

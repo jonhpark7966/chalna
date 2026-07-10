@@ -36,12 +36,21 @@ export ELEVENLABS_API_KEY="..."
 | `SCRIBE_MODEL_ID` | `scribe_v2` | Scribe 모델 ID |
 | `CHALNA_SCRIBE_CACHE_DIR` | `chalna/results/scribe_cache` | Scribe 원문 응답 캐시 디렉터리 |
 | `CHALNA_SCRIBE_TIMEOUT` | `600` | Scribe API timeout seconds |
+| `CHALNA_SCRIBE_DELIVERY_MODE` | `webhook` | 기본은 비동기 수신, 비상 동기 경로는 `sync` |
+| `ELEVENLABS_WEBHOOK_ID` | 없음 | Speech-to-Text 완료 webhook ID |
+| `ELEVENLABS_WEBHOOK_SECRET` | 없음 | HMAC 검증용 webhook secret |
+| `CHALNA_SCRIBE_WEBHOOK_TIMEOUT` | `7200` | 완료 webhook 대기 시간(초) |
+| `CHALNA_SCRIBE_RECOVERY_TIMEOUT` | `90` | 기존 provider transcript 조회 timeout(초) |
 | `CHALNA_LLM_SEGMENTATION_CACHE_DIR` | `chalna/results/segment_cache` | LLM segment plan 캐시 디렉터리 |
 | `CHALNA_LLM_SEGMENTATION_MODEL` | `gpt-5.5` | word-to-segment planning 모델 |
 | `CHALNA_LLM_SEGMENTATION_REASONING_EFFORT` | `xhigh` | planning reasoning effort |
 | `CHALNA_LLM_SEGMENTATION_TIMEOUT` | `180` | planning timeout seconds |
 
 `SCRIBE_CACHE_DIR`, `SCRIBE_TIMEOUT`도 이전 설정명 호환을 위해 계속 동작합니다.
+
+FastAPI 서비스의 신규 Scribe 작업은 기본적으로 webhook delivery를 사용합니다. 독립 실행형
+`chalna transcribe` 명령은 callback 서버와 durable runtime이 없으므로 운영자용 sync fallback을
+명시적으로 사용합니다.
 
 ### LLM 설정 (Optional)
 

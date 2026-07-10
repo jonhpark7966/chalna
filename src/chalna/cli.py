@@ -156,12 +156,16 @@ def transcribe(
             task = progress.add_task("Transcribing with Scribe v2...", total=None)
 
             from chalna.pipeline import ChalnaPipeline
+            from chalna.scribe_client import ScribeClient
 
             pipeline = ChalnaPipeline(
                 device=device,
                 use_alignment=False,
                 use_llm_refinement=llm_refine,
                 use_llm_segmentation=llm_segmentation,
+                # Standalone CLI has no callback server or durable runtime.
+                # Keep it as the explicit operator-only synchronous fallback.
+                scribe_client=ScribeClient(delivery_mode="sync"),
             )
 
             progress.update(task, description="Transcribing audio...")

@@ -342,13 +342,16 @@ class ElevenLabsAPIError(ChalnaError):
         message: str,
         cause: Optional[Exception] = None,
         status_code: Optional[int] = None,
+        details: Optional[dict[str, Any]] = None,
     ):
-        details = {
+        error_details = {
             "reason": message,
         }
         if status_code is not None:
-            details["status_code"] = status_code
-        super().__init__(message, details, cause)
+            error_details["status_code"] = status_code
+        if details:
+            error_details.update(details)
+        super().__init__(message, error_details, cause)
 
 
 # =============================================================================

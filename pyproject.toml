@@ -21,6 +21,7 @@ dependencies = [
     "typer>=0.9.0",
     "rich>=13.0.0",
     "httpx>=0.25.0",
+    "elevenlabs==2.57.0",
     "pydantic>=2.5.0",
     "pydantic-settings>=2.1.0",
     "sentry-sdk[fastapi]>=2.0.0",

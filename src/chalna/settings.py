@@ -39,6 +39,30 @@ class Settings(BaseSettings):
         default=600.0,
         validation_alias=AliasChoices("CHALNA_SCRIBE_TIMEOUT", "SCRIBE_TIMEOUT"),
     )
+    scribe_delivery_mode: str = Field(
+        default="webhook",
+        validation_alias="CHALNA_SCRIBE_DELIVERY_MODE",
+    )
+    scribe_webhook_id: Optional[str] = Field(
+        default=None,
+        validation_alias="ELEVENLABS_WEBHOOK_ID",
+    )
+    scribe_webhook_secret: Optional[str] = Field(
+        default=None,
+        validation_alias="ELEVENLABS_WEBHOOK_SECRET",
+    )
+    scribe_webhook_timeout: float = Field(
+        default=7200.0,
+        validation_alias="CHALNA_SCRIBE_WEBHOOK_TIMEOUT",
+    )
+    scribe_webhook_poll_interval: float = Field(
+        default=0.5,
+        validation_alias="CHALNA_SCRIBE_WEBHOOK_POLL_INTERVAL",
+    )
+    scribe_recovery_timeout: float = Field(
+        default=90.0,
+        validation_alias="CHALNA_SCRIBE_RECOVERY_TIMEOUT",
+    )
     llm_segmentation_cache_dir: str = Field(
         default=str(_DEFAULT_SEGMENT_CACHE_DIR),
         validation_alias=AliasChoices(

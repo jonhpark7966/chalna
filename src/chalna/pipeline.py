@@ -102,6 +102,7 @@ class ChalnaPipeline:
         scribe_options: Optional[ScribeOptions] = None,
         llm_segmentation_options: Optional[LlmSegmentationOptions] = None,
         overlap_protection: Optional[dict[str, Any] | list[Any]] = None,
+        chalna_job_id: Optional[str] = None,
     ) -> TranscriptionResult:
         """Transcribe an audio/video file to Chalna segments and subtitles."""
         del max_new_tokens  # Kept for compatibility with the previous local ASR API.
@@ -138,11 +139,13 @@ class ChalnaPipeline:
         scribe_response = self.scribe_cache.get(cache_metadata)
         cache_hit = scribe_response is not None
         if scribe_response is None:
-            scribe_response = self.scribe_client.transcribe(
-                audio_path,
-                language_code=language,
-                options=options,
-            )
+            scribe_kwargs: dict[str, Any] = {
+                "language_code": language,
+                "options": options,
+            }
+            if chalna_job_id is not None:
+                scribe_kwargs["chalna_job_id"] = chalna_job_id
+            scribe_response = self.scribe_client.transcribe(audio_path, **scribe_kwargs)
             self.scribe_cache.put(cache_metadata, scribe_response)
 
         self._last_scribe_response = scribe_response

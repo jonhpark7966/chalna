@@ -5,9 +5,10 @@ Chalna REST API Server.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
-import tempfile
+import shutil
 import uuid
 from datetime import datetime
 from datetime import timedelta as _timedelta
@@ -21,21 +22,42 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
 from chalna import __version__
+from chalna.db import (
+    commit_provider_failure_webhook,
+    commit_provider_webhook,
+    find_job_runtime_by_provider_request,
+    init_db,
+    list_failed_provider_recovery_runtimes,
+    list_recoverable_job_runtimes,
+    migrate_from_results_dir,
+    save_job_runtime,
+    update_job_runtime,
+)
 from chalna.db import count_jobs as db_count_jobs
 from chalna.db import get_job as db_get_job
-from chalna.db import init_db, migrate_from_results_dir
+from chalna.db import get_job_runtime as db_get_job_runtime
 from chalna.db import list_jobs as db_list_jobs
 from chalna.db import save_job as db_save_job
-from chalna.exceptions import ChalnaError
+from chalna.exceptions import ChalnaError, ElevenLabsAPIError
 from chalna.models import LlmSegmentationOptions, ScribeOptions
 from chalna.monitoring import capture_job_exception, init_sentry
-from chalna.segmentation_boundary import DEFAULT_BOUNDARY_RULE, normalize_boundary_rule
+from chalna.scribe_client import (
+    extract_webhook_transcription,
+    recover_verified_provider_spool,
+)
+from chalna.segmentation_boundary import (
+    DEFAULT_BOUNDARY_RULE,
+    apply_boundary_rule,
+    normalize_boundary_rule,
+)
 from chalna.settings import settings
 from chalna.validation import validate_audio_file
 
 # Results storage directory
 RESULTS_DIR = Path(os.environ.get("CHALNA_RESULTS_DIR", "/home/jonhpark/workspace/chalna/results"))
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+PENDING_DIR = RESULTS_DIR / "pending"
+PENDING_DIR.mkdir(parents=True, exist_ok=True)
 
 # =============================================================================
 # App Setup
@@ -434,6 +456,15 @@ class JobResponse(BaseModel):
     estimated_wait_seconds: Optional[float] = None
     estimated_processing_seconds: Optional[float] = None
     estimated_completion: Optional[datetime] = None
+    # Durable provider state. These fields let callers recover accepted work
+    # without starting a duplicate transcription.
+    provider_state: Optional[str] = None
+    provider_request_id: Optional[str] = None
+    provider_transcription_id: Optional[str] = None
+    provider_trace_id: Optional[str] = None
+    failure_kind: Optional[str] = None
+    retryable: bool = False
+    resubmit_safe: bool = False
 
 
 class HealthResponse(BaseModel):
@@ -498,6 +529,144 @@ class TranslateRequest(BaseModel):
 class TranslateResponse(BaseModel):
     translations: List[TranslateSegmentIO]
     target_language: str
+
+
+async def _save_upload_to_spool(
+    upload: UploadFile,
+    job_id: str,
+    *,
+    basename: str = "input",
+) -> Path:
+    """Stream an upload to durable per-job storage instead of buffering it in RAM."""
+    suffix = Path(upload.filename or "").suffix
+    job_dir = PENDING_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    target = job_dir / f"{basename}{suffix}"
+    try:
+        with target.open("wb") as output:
+            while chunk := await upload.read(1024 * 1024):
+                output.write(chunk)
+    except OSError as exc:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=f"Failed to persist upload: {exc}") from exc
+    return target
+
+
+def _runtime_params_for_storage(job_id: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    stored = dict(params)
+    stored["audio_path"] = str(stored["audio_path"])
+    override = stored.pop("scribe_response_override", None)
+    if override is not None:
+        override_path = PENDING_DIR / job_id / "scribe_response.json"
+        override_path.write_text(
+            json.dumps(override, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        stored["scribe_response_override_path"] = str(override_path)
+    return stored
+
+
+def _runtime_params_for_execution(params: Dict[str, Any]) -> Dict[str, Any]:
+    restored = dict(params)
+    restored["audio_path"] = Path(str(restored["audio_path"]))
+    override_path = restored.pop("scribe_response_override_path", None)
+    if override_path:
+        restored["scribe_response_override"] = json.loads(
+            Path(str(override_path)).read_text(encoding="utf-8")
+        )
+    return restored
+
+
+def _job_runtime_dump(job: Job) -> Dict[str, Any]:
+    """Serialize restart metadata without duplicating large transcript artifacts in SQLite."""
+    payload = job.model_dump(mode="json")
+    payload["raw_scribe_response"] = None
+    if job.status in (JobStatus.COMPLETED, JobStatus.FAILED):
+        payload["result"] = None
+        payload["raw_srt"] = None
+        payload["aligned_srt"] = None
+        payload["refined_srt"] = None
+        payload["chunk_raw_srts"] = {}
+    return payload
+
+
+def _register_runtime_job(job: Job, params: Dict[str, Any]) -> None:
+    stored_params = _runtime_params_for_storage(job.job_id, params)
+    save_job_runtime(
+        job_id=job.job_id,
+        job_status=job.status.value,
+        job_json=_job_runtime_dump(job),
+        params_json=stored_params,
+        input_path=str(params["audio_path"]),
+    )
+    if params.get("scribe_response_override") is not None:
+        update_job_runtime(job.job_id, provider_state="provided_response")
+
+
+def _provider_status(job_id: str) -> Dict[str, Any]:
+    runtime = db_get_job_runtime(job_id) or {}
+    return {
+        "provider_state": runtime.get("provider_state"),
+        "provider_request_id": runtime.get("provider_request_id"),
+        "provider_transcription_id": runtime.get("provider_transcription_id"),
+        "provider_trace_id": runtime.get("provider_trace_id"),
+        "failure_kind": runtime.get("failure_kind"),
+        "retryable": bool(runtime.get("retryable")),
+        "resubmit_safe": bool(runtime.get("resubmit_safe")),
+    }
+
+
+def _cleanup_job_spool(job_id: str) -> None:
+    shutil.rmtree(PENDING_DIR / job_id, ignore_errors=True)
+
+
+async def _restore_runtime_job(job_id: str, *, enqueue: bool = True) -> bool:
+    """Rehydrate one durable job. Accepted provider work is resumed, never re-posted."""
+    runtime = db_get_job_runtime(job_id)
+    if runtime is None or job_id in _jobs:
+        return False
+    recover_verified_provider_spool(job_id, runtime)
+    runtime = db_get_job_runtime(job_id)
+    if runtime is None or runtime.get("job_status") == "failed":
+        return False
+    input_path = runtime.get("input_path")
+    if not input_path or not Path(str(input_path)).is_file():
+        update_job_runtime(
+            job_id,
+            job_status="failed",
+            provider_state="failed_permanent",
+            failure_kind="durable_input_missing",
+            retryable=False,
+            resubmit_safe=False,
+        )
+        return False
+    try:
+        job = Job.model_validate(runtime["job_json"])
+        params = _runtime_params_for_execution(runtime["params_json"])
+    except (ValueError, OSError, json.JSONDecodeError) as exc:
+        update_job_runtime(
+            job_id,
+            job_status="failed",
+            provider_state="failed_permanent",
+            failure_kind="runtime_state_invalid",
+            retryable=False,
+            resubmit_safe=False,
+        )
+        print(f"Failed to restore durable job {job_id}: {exc}")
+        return False
+    job.status = JobStatus.QUEUED
+    job.error = None
+    job.error_details = None
+    _jobs[job_id] = job
+    _job_params[job_id] = params
+    update_job_runtime(
+        job_id,
+        job_status="queued",
+        job_json=_job_runtime_dump(job),
+    )
+    if enqueue:
+        await _job_queue.put(job_id)
+    return True
 
 
 # =============================================================================
@@ -570,6 +739,34 @@ def _run_doctor_checks() -> List[DoctorCheck]:
         critical=True,
         detail=settings.scribe_model_id,
     ))
+    delivery_mode_valid = settings.scribe_delivery_mode in {"sync", "webhook"}
+    checks.append(DoctorCheck(
+        name="scribe_delivery_mode",
+        ok=delivery_mode_valid,
+        critical=True,
+        detail=settings.scribe_delivery_mode,
+    ))
+    if settings.scribe_delivery_mode == "webhook":
+        checks.append(DoctorCheck(
+            name="elevenlabs_webhook_id",
+            ok=bool(settings.scribe_webhook_id),
+            critical=True,
+            detail=(
+                "configured"
+                if settings.scribe_webhook_id
+                else "ELEVENLABS_WEBHOOK_ID is not set"
+            ),
+        ))
+        checks.append(DoctorCheck(
+            name="elevenlabs_webhook_secret",
+            ok=bool(settings.scribe_webhook_secret),
+            critical=True,
+            detail=(
+                "configured"
+                if settings.scribe_webhook_secret
+                else "ELEVENLABS_WEBHOOK_SECRET is not set"
+            ),
+        ))
     checks.append(DoctorCheck(
         name="scribe_cache",
         ok=True,
@@ -702,12 +899,8 @@ async def transcribe(
     )
     overlap_protection = await _read_overlap_intervals_upload(overlap_intervals)
 
-    # Save uploaded file
-    suffix = Path(file.filename).suffix
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        content = await file.read()
-        tmp.write(content)
-        tmp_path = Path(tmp.name)
+    job_id = str(uuid.uuid4())
+    tmp_path = await _save_upload_to_spool(file, job_id)
 
     # Validate audio file upfront (fail fast before queuing)
     try:
@@ -717,7 +910,6 @@ async def transcribe(
         raise
 
     # Create internal job and enqueue
-    job_id = str(uuid.uuid4())
     job = Job(
         job_id=job_id,
         status=JobStatus.QUEUED,
@@ -749,6 +941,7 @@ async def transcribe(
         include_intermediate=include_intermediate,
         overlap_protection=overlap_protection,
     )
+    _register_runtime_job(job, _job_params[job_id])
 
     event = asyncio.Event()
     _job_events[job_id] = event
@@ -830,12 +1023,8 @@ async def transcribe_async(
     )
     overlap_protection = await _read_overlap_intervals_upload(overlap_intervals)
 
-    # Save uploaded file
-    suffix = Path(file.filename).suffix
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        content = await file.read()
-        tmp.write(content)
-        tmp_path = Path(tmp.name)
+    job_id = str(uuid.uuid4())
+    tmp_path = await _save_upload_to_spool(file, job_id)
 
     # Validate audio file upfront (fail fast)
     try:
@@ -846,7 +1035,6 @@ async def transcribe_async(
         raise
 
     # Create job
-    job_id = str(uuid.uuid4())
     job = Job(
         job_id=job_id,
         status=JobStatus.QUEUED,
@@ -879,6 +1067,7 @@ async def transcribe_async(
         include_intermediate=include_intermediate,
         overlap_protection=overlap_protection,
     )
+    _register_runtime_job(job, _job_params[job_id])
     await _job_queue.put(job_id)
 
     # Compute ETA
@@ -947,11 +1136,8 @@ async def transcribe_from_scribe_async(
     if not isinstance(raw_payload, dict):
         raise HTTPException(status_code=400, detail="Scribe response must be a JSON object")
 
-    suffix = Path(file.filename).suffix
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        content = await file.read()
-        tmp.write(content)
-        tmp_path = Path(tmp.name)
+    job_id = str(uuid.uuid4())
+    tmp_path = await _save_upload_to_spool(file, job_id)
 
     try:
         audio_info = validate_audio_file(tmp_path)
@@ -959,7 +1145,6 @@ async def transcribe_from_scribe_async(
         tmp_path.unlink(missing_ok=True)
         raise
 
-    job_id = str(uuid.uuid4())
     job = Job(
         job_id=job_id,
         status=JobStatus.QUEUED,
@@ -993,6 +1178,7 @@ async def transcribe_from_scribe_async(
         scribe_response_override=raw_payload,
         overlap_protection=overlap_protection,
     )
+    _register_runtime_job(job, _job_params[job_id])
     await _job_queue.put(job_id)
 
     eta = _compute_eta(job_id)
@@ -1004,6 +1190,272 @@ async def transcribe_from_scribe_async(
         estimated_processing_seconds=eta.get("processing_seconds"),
         estimated_completion=eta.get("completion"),
     )
+
+
+def _write_provider_payload_atomic(
+    payload_path: Path,
+    transcription: Dict[str, Any],
+) -> None:
+    """Atomically publish a provider payload using a delivery-unique temp file."""
+    temporary_path = payload_path.with_name(
+        f".{payload_path.name}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        temporary_path.write_text(
+            json.dumps(transcription, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        temporary_path.replace(payload_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def _classify_provider_webhook_failure(
+    delivery: Dict[str, Any],
+) -> tuple[str, bool, bool, str]:
+    raw_error = delivery.get("provider_error")
+    if isinstance(raw_error, dict):
+        status_code = raw_error.get("status_code") or raw_error.get("status")
+        error_text = json.dumps(raw_error, ensure_ascii=False, default=str)
+    else:
+        status_code = delivery.get("provider_status_code")
+        error_text = str(raw_error or "ElevenLabs transcription failed")
+    try:
+        status_code = int(status_code) if status_code is not None else None
+    except (TypeError, ValueError):
+        status_code = None
+
+    normalized = error_text.lower()
+    if status_code in {400, 401, 403, 404, 413, 415, 422} or any(
+        token in normalized
+        for token in ("auth", "invalid", "unsupported", "too large", "permission")
+    ):
+        return "provider_terminal_permanent", False, False, error_text
+    if status_code == 429 or (status_code is not None and status_code >= 500) or any(
+        token in normalized
+        for token in ("rate limit", "timeout", "temporar", "unavailable", "internal")
+    ):
+        return "provider_terminal_transient", True, True, error_text
+    # Unknown terminal failures are retryable for operator recovery, but not
+    # automatically safe to resubmit without confirming provider state.
+    return "provider_terminal_unknown", True, False, error_text
+
+
+@app.post("/webhooks/elevenlabs/speech-to-text")
+async def receive_elevenlabs_speech_to_text_webhook(request: Request):
+    """Verify and durably accept a completed ElevenLabs Scribe delivery."""
+    if not settings.scribe_webhook_secret:
+        raise HTTPException(status_code=503, detail="ElevenLabs webhook secret is not configured")
+    raw_body = await request.body()
+    signature = request.headers.get("elevenlabs-signature")
+    try:
+        from elevenlabs import ElevenLabs
+        from elevenlabs.errors import BadRequestError
+
+        event = ElevenLabs(
+            api_key=settings.elevenlabs_api_key or "unused"
+        ).webhooks.construct_event(
+            rawBody=raw_body.decode("utf-8"),
+            sig_header=signature or "",
+            secret=settings.scribe_webhook_secret,
+        )
+    except BadRequestError as exc:
+        raise HTTPException(status_code=401, detail="Invalid ElevenLabs webhook signature") from exc
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid ElevenLabs webhook payload") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail="Invalid ElevenLabs webhook signature") from exc
+
+    try:
+        transcription, delivery = extract_webhook_transcription(event)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    metadata = delivery["webhook_metadata"]
+    job_id = metadata.get("chalna_job_id")
+    runtime = db_get_job_runtime(str(job_id)) if job_id else None
+    if runtime is None and delivery.get("request_id"):
+        runtime = find_job_runtime_by_provider_request(str(delivery["request_id"]))
+        job_id = runtime.get("job_id") if runtime else None
+    if runtime is None or not job_id:
+        # The delivery is authentic but cannot be correlated. A 2xx prevents an
+        # infinite provider retry loop; the hash remains useful in provider logs.
+        return JSONResponse(
+            status_code=202,
+            content={"status": "ignored", "reason": "unknown_chalna_job"},
+        )
+
+    request_id = delivery.get("request_id") or runtime.get("provider_request_id")
+    existing_request_id = runtime.get("provider_request_id")
+    if existing_request_id and request_id and str(existing_request_id) != str(request_id):
+        raise HTTPException(status_code=409, detail="Webhook request ID does not match job")
+
+    transcription_id = delivery.get("transcription_id")
+    delivery_id = transcription_id or request_id or hashlib.sha256(raw_body).hexdigest()
+    if delivery.get("terminal_failure"):
+        failure_kind, retryable, resubmit_safe, provider_error = (
+            _classify_provider_webhook_failure(delivery)
+        )
+        job_dir = PENDING_DIR / str(job_id)
+        job_dir.mkdir(parents=True, exist_ok=True)
+        failure_path = job_dir / "provider_failure.json"
+        _write_provider_payload_atomic(failure_path, event)
+        failure_result = commit_provider_failure_webhook(
+            job_id=str(job_id),
+            event_key=f"speech_to_text_failure:{delivery_id}",
+            event_type=delivery["event_type"],
+            provider_request_id=str(request_id) if request_id else None,
+            provider_transcription_id=(
+                str(transcription_id) if transcription_id else None
+            ),
+            provider_trace_id=(
+                request.headers.get("x-trace-id") or request.headers.get("trace-id")
+            ),
+            payload_path=str(failure_path),
+            provider_error=provider_error,
+            failure_kind=failure_kind,
+            retryable=retryable,
+            resubmit_safe=resubmit_safe,
+        )
+        return {
+            "status": "failure_received",
+            "duplicate": bool(failure_result["duplicate"]),
+            "ignored_due_completed": bool(failure_result["ignored_due_completed"]),
+            "job_id": str(job_id),
+        }
+
+    event_key = f"speech_to_text:{delivery_id}"
+
+    job_dir = PENDING_DIR / str(job_id)
+    job_dir.mkdir(parents=True, exist_ok=True)
+    payload_path = job_dir / "provider_response.json"
+    _write_provider_payload_atomic(payload_path, transcription)
+
+    trace_id = request.headers.get("x-trace-id") or request.headers.get("trace-id")
+    commit_result = commit_provider_webhook(
+        job_id=str(job_id),
+        event_key=event_key,
+        event_type=delivery["event_type"],
+        provider_request_id=str(request_id) if request_id else None,
+        provider_transcription_id=str(transcription_id) if transcription_id else None,
+        provider_trace_id=trace_id or runtime.get("provider_trace_id"),
+        payload_path=str(payload_path),
+    )
+
+    revived = False
+    committed_runtime = commit_result["runtime"]
+    if (
+        committed_runtime.get("job_status") == "queued"
+        and committed_runtime.get("provider_state") == "completed"
+    ):
+        memory_job = _jobs.get(str(job_id))
+        if memory_job is not None and memory_job.status == JobStatus.FAILED:
+            _jobs.pop(str(job_id), None)
+        revived = await _restore_runtime_job(str(job_id), enqueue=True)
+
+    return {
+        "status": "received",
+        "duplicate": bool(commit_result["duplicate"]),
+        "job_id": str(job_id),
+        "revived": revived,
+    }
+
+
+def _require_local_request(request: Request) -> None:
+    host = request.client.host if request.client else ""
+    if host not in {"127.0.0.1", "::1", "localhost"}:
+        raise HTTPException(status_code=403, detail="Provider recovery is local-only")
+
+
+def _raw_srt_from_provider_response(
+    payload: Dict[str, Any],
+    *,
+    include_audio_events: bool = True,
+) -> str:
+    """Render the same default raw SRT contract used by the normal pipeline."""
+    from chalna.scribe_adapter import scribe_response_to_segments
+    from chalna.srt_utils import segments_to_srt
+
+    adapter_result = scribe_response_to_segments(
+        payload,
+        include_audio_events=include_audio_events,
+    )
+    boundary_result = apply_boundary_rule(
+        adapter_result.segments,
+        rule=DEFAULT_BOUNDARY_RULE,
+    )
+    return segments_to_srt(boundary_result.segments, include_speaker=True)
+
+
+@app.get("/provider/transcripts/{transcription_id}")
+async def recover_provider_transcript(
+    transcription_id: str,
+    request: Request,
+    include_audio_events: bool = True,
+):
+    """Retrieve completed provider output without creating a new transcription."""
+    _require_local_request(request)
+    from chalna.scribe_client import ScribeClient
+
+    recovery_client = ScribeClient(timeout=settings.scribe_recovery_timeout)
+    try:
+        payload, provider_metadata = await asyncio.to_thread(
+            recovery_client.get_transcript,
+            transcription_id,
+        )
+    except ElevenLabsAPIError as exc:
+        provider_status = exc.details.get("status_code")
+        if isinstance(provider_status, int) and 400 <= provider_status < 500:
+            raise HTTPException(
+                status_code=provider_status,
+                detail={
+                    "message": exc.message,
+                    "failure_kind": exc.details.get("failure_kind"),
+                    "retryable": bool(exc.details.get("retryable")),
+                    "resubmit_safe": False,
+                    "provider_transcription_id": transcription_id,
+                },
+            ) from exc
+        raise
+    words = payload.get("words") if isinstance(payload.get("words"), list) else []
+    timed_words = [
+        item
+        for item in words
+        if isinstance(item, dict) and item.get("type", "word") == "word"
+    ]
+    speakers = sorted(
+        {
+            str(item["speaker_id"])
+            for item in timed_words
+            if item.get("speaker_id") is not None
+        }
+    )
+    max_word_end = max(
+        (
+            float(item["end"])
+            for item in timed_words
+            if isinstance(item.get("end"), (int, float))
+        ),
+        default=0.0,
+    )
+    duration = payload.get("audio_duration_secs")
+    if not isinstance(duration, (int, float)):
+        duration = max_word_end
+    return {
+        "scribe_response": payload,
+        "raw_srt": _raw_srt_from_provider_response(
+            payload,
+            include_audio_events=include_audio_events,
+        ),
+        "metadata": {
+            **provider_metadata,
+            "language_code": payload.get("language_code"),
+            "audio_duration_secs": float(duration),
+            "max_word_end": max_word_end,
+            "word_count": len(timed_words),
+            "speakers": speakers,
+        },
+    }
 
 
 @app.get("/jobs")
@@ -1057,6 +1509,7 @@ async def get_active_jobs():
                 "estimated_completion": (
                     eta.get("completion").isoformat() if eta.get("completion") else None
                 ),
+                **_provider_status(job.job_id),
             })
     return {"jobs": active}
 
@@ -1109,6 +1562,7 @@ async def get_job(job_id: str):
             estimated_wait_seconds=eta.get("wait_seconds"),
             estimated_processing_seconds=eta.get("processing_seconds"),
             estimated_completion=eta.get("completion"),
+            **_provider_status(job_id),
         )
 
     # Fallback: DB historical job
@@ -1116,20 +1570,23 @@ async def get_job(job_id: str):
     if db_job is None:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    # Try to load SRT result from disk
-    result_srt = None
+    # Load the exact API result first; older jobs fall back to their final SRT.
+    persisted_result = None
     if db_job.get("has_result_files") and db_job.get("results_dir"):
-        result_srt = _load_srt_from_results(db_job["results_dir"])
+        persisted_result = _load_api_result_from_results(db_job["results_dir"])
+        if persisted_result is None:
+            persisted_result = _load_srt_from_results(db_job["results_dir"])
 
     return JobResponse(
         job_id=db_job["job_id"],
         status=db_job["status"],
         progress=1.0 if db_job["status"] == "completed" else 0.0,
-        result=result_srt,
+        result=persisted_result,
         error=db_job.get("error"),
         refined=db_job.get("refined"),
         started_at=db_job.get("started_at"),
         audio_duration=db_job.get("audio_duration"),
+        **_provider_status(job_id),
     )
 
 
@@ -1183,6 +1640,14 @@ async def _queue_worker():
             if job and job.status not in (JobStatus.COMPLETED, JobStatus.FAILED):
                 job.status = JobStatus.FAILED
                 job.error = f"Queue worker error: {e}"
+                update_job_runtime(
+                    job_id,
+                    job_status="failed",
+                    job_json=_job_runtime_dump(job),
+                    failure_kind="queue_worker",
+                    retryable=True,
+                    resubmit_safe=False,
+                )
         finally:
             _job_queue.task_done()
             event = _job_events.pop(job_id, None)
@@ -1241,6 +1706,11 @@ async def _process_job(
             start, end = stage_weights[stage]
             job.progress = start + (end - start) * progress
 
+        if stage == "transcribing" and kwargs.get("cache_hit"):
+            runtime = db_get_job_runtime(job_id)
+            if runtime and runtime.get("provider_state") == "queued":
+                update_job_runtime(job_id, provider_state="cache_hit")
+
         # Store intermediate results as stages complete
         if progress >= 1.0:
             try:
@@ -1257,6 +1727,11 @@ async def _process_job(
         job.status = JobStatus.PROCESSING
         job.started_at = datetime.utcnow()
         job.progress = 0.0
+        update_job_runtime(
+            job_id,
+            job_status="processing",
+            job_json=_job_runtime_dump(job),
+        )
 
         # Get pipeline
         pipeline = get_pipeline()
@@ -1302,6 +1777,7 @@ async def _process_job(
                     scribe_options=scribe_options,
                     llm_segmentation_options=llm_segmentation_options,
                     overlap_protection=overlap_protection,
+                    chalna_job_id=job_id,
                 )
             )
             job.raw_scribe_response = pipeline._last_scribe_response
@@ -1362,8 +1838,47 @@ async def _process_job(
         # Save results to files
         _save_job_results(job, result, include_speaker)
         _save_job_to_db(job)
+        update_job_runtime(
+            job_id,
+            job_status="completed",
+            job_json=_job_runtime_dump(job),
+            input_path=None,
+            retryable=False,
+            resubmit_safe=False,
+        )
 
     except ChalnaError as e:
+        runtime = db_get_job_runtime(job_id) or {}
+        payload_path = runtime.get("provider_payload_path")
+        if e.details.get("failure_kind") == "provider_result_pending" and payload_path:
+            try:
+                recovered_payload = json.loads(
+                    Path(str(payload_path)).read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError):
+                recovered_payload = None
+            if isinstance(recovered_payload, dict):
+                await _process_job(
+                    job_id=job_id,
+                    audio_path=audio_path,
+                    context=context,
+                    language=language,
+                    include_speaker=include_speaker,
+                    use_alignment=use_alignment,
+                    use_llm_segmentation=use_llm_segmentation,
+                    bypass_llm_segmentation_cache=bypass_llm_segmentation_cache,
+                    use_llm_refinement=use_llm_refinement,
+                    segmentation_boundary_rule=segmentation_boundary_rule,
+                    diarize=diarize,
+                    tag_audio_events=tag_audio_events,
+                    num_speakers=num_speakers,
+                    output_format=output_format,
+                    include_logs=include_logs,
+                    include_intermediate=include_intermediate,
+                    scribe_response_override=recovered_payload,
+                    overlap_protection=overlap_protection,
+                )
+                return
         if e.http_status >= 500:
             capture_job_exception(
                 e,
@@ -1384,6 +1899,34 @@ async def _process_job(
         job.error_details = {**e.to_dict(), "http_status": e.http_status}
         _save_job_error(job)
         _save_job_to_db(job)
+        details = e.details if isinstance(e.details, dict) else {}
+        runtime_update: Dict[str, Any] = {
+            "job_status": "failed",
+            "job_json": _job_runtime_dump(job),
+            "failure_kind": details.get("failure_kind") or "chalna_error",
+            "retryable": bool(details.get("retryable")),
+            "resubmit_safe": bool(details.get("resubmit_safe")),
+        }
+        if details.get("failure_kind"):
+            if str(details["failure_kind"]).startswith("provider_terminal_"):
+                runtime_update["provider_state"] = (
+                    "failed_retryable" if details.get("retryable") else "failed_permanent"
+                )
+            elif not details.get("retryable"):
+                runtime_update["provider_state"] = "failed_permanent"
+            elif details.get("resubmit_safe"):
+                runtime_update["provider_state"] = "failed_retryable"
+            else:
+                runtime_update["provider_state"] = "recovery_required"
+        for field in (
+            "provider_request_id",
+            "provider_transcription_id",
+            "provider_trace_id",
+            "provider_error",
+        ):
+            if details.get(field):
+                runtime_update[field] = details[field]
+        update_job_runtime(job_id, **runtime_update)
 
     except Exception as e:
         capture_job_exception(
@@ -1401,10 +1944,29 @@ async def _process_job(
         job.error = str(e)
         _save_job_error(job)
         _save_job_to_db(job)
+        update_job_runtime(
+            job_id,
+            job_status="failed",
+            job_json=_job_runtime_dump(job),
+            failure_kind="application_error",
+            retryable=False,
+            resubmit_safe=False,
+        )
 
     finally:
-        # Cleanup
-        audio_path.unlink(missing_ok=True)
+        runtime = db_get_job_runtime(job_id) or {}
+        preserve_for_provider = runtime.get("provider_state") in {
+            "accepted",
+            "awaiting_webhook",
+            "submission_unknown",
+            "recovery_required",
+            "submitting",
+            "failed_retryable",
+            "failed_permanent",
+        }
+        if not preserve_for_provider:
+            _cleanup_job_spool(job_id)
+            audio_path.unlink(missing_ok=True)
 
 
 # =============================================================================
@@ -1426,6 +1988,19 @@ def _load_srt_from_results(results_dir_name: str) -> Optional[str]:
                 return srt_file.read_text(encoding="utf-8")
             except OSError:
                 return None
+    return None
+
+
+def _load_api_result_from_results(results_dir_name: str) -> Optional[str]:
+    """Load the exact API result persisted for restart-safe polling."""
+    job_dir = RESULTS_DIR / results_dir_name
+    if not job_dir.is_dir():
+        return None
+    for result_file in sorted(job_dir.glob("*_api_result.txt"), reverse=True):
+        try:
+            return result_file.read_text(encoding="utf-8")
+        except OSError:
+            return None
     return None
 
 
@@ -1492,6 +2067,19 @@ def _save_job_results(job: Job, result, include_speaker: bool) -> None:
             json.dumps(json_data, ensure_ascii=False, indent=2, default=str),
             encoding="utf-8",
         )
+
+        # Polling may happen after a service restart. Persist the exact response
+        # returned by /jobs/{job_id}, including raw Scribe JSON when requested.
+        if job.result is not None:
+            (job_dir / f"{base_name}_api_result.txt").write_text(
+                job.result,
+                encoding="utf-8",
+            )
+        if job.raw_scribe_response is not None:
+            (job_dir / f"{base_name}_scribe_response.json").write_text(
+                json.dumps(job.raw_scribe_response, ensure_ascii=False),
+                encoding="utf-8",
+            )
 
         # Save intermediate SRT files (generate from result.intermediate if not in job)
         from chalna.srt_utils import segments_to_srt
@@ -1565,6 +2153,20 @@ async def startup():
 
     _queue_worker_task = asyncio.create_task(_queue_worker())
     print("Job queue worker started")
+    restored = 0
+    recovery_candidates = [
+        *list_recoverable_job_runtimes(),
+        *list_failed_provider_recovery_runtimes(),
+    ]
+    seen_job_ids: set[str] = set()
+    for runtime in recovery_candidates:
+        if runtime["job_id"] in seen_job_ids:
+            continue
+        seen_job_ids.add(runtime["job_id"])
+        if await _restore_runtime_job(runtime["job_id"], enqueue=True):
+            restored += 1
+    if restored:
+        print(f"Restored {restored} durable queued/provider jobs")
     print(f"Results will be saved to: {RESULTS_DIR}")
 
 
@@ -1582,11 +2184,8 @@ async def shutdown():
             pass
         _queue_worker_task = None
 
-    # Cleanup temp files from pending jobs
-    for job_id, params in _job_params.items():
-        audio_path = params.get("audio_path")
-        if audio_path and hasattr(audio_path, "unlink"):
-            audio_path.unlink(missing_ok=True)
+    # Pending inputs are a durable spool. They are intentionally left on disk
+    # so accepted provider work can resume without another billable POST.
     _job_params.clear()
 
     # Wake up any waiting sync events
